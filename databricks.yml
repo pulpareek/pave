@@ -1,0 +1,115 @@
+# =============================================================================
+# PAVE — Platform Asset Vending Engine
+# Databricks Asset Bundle (root configuration)
+# =============================================================================
+# PAVE is a self-service, governed resource-provisioning portal built entirely
+# on Databricks Apps. This bundle deploys PAVE itself: the FastAPI+React app,
+# the serverless provisioning Job (the engine that creates/decommissions
+# resources on approval), and the AI/BI FinOps dashboard.
+#
+# NOTE: This YAML bundle deploying PAVE *itself* is one of the two DABs flavors
+# in the demo. The runtime provisioning engine uses the Databricks SDK (and an
+# opt-in Python-DABs schema showcase). See docs / the plan for the rationale.
+# =============================================================================
+
+bundle:
+  name: pave
+  uuid: 95644c47-00a8-4fae-a4ba-60e6871b1837
+  databricks_cli_version: ">=0.239.0" # apps: resource support
+
+include:
+  - resources/*.yml
+  # Optional local overrides with your real host/ids (gitignored; matches nothing on a
+  # fresh clone). Copy the shape from README "Setup" into databricks.local.yml.
+  - "*.local.yml"
+
+# =============================================================================
+# Sync — keep the frontend node_modules / build cruft out of the workspace
+# =============================================================================
+sync:
+  exclude:
+    - "src/app/frontend/node_modules/**"
+    - "src/app/frontend/src/**"
+    - "src/app/frontend/*.config.*"
+    - "src/app/frontend/package*.json"
+    - "**/__pycache__/**"
+    - "**/.pytest_cache/**"
+    - "**/.venv/**"
+    - "**/*.pyc"
+    - ".git/**"
+    - "*.log"
+
+# =============================================================================
+# Variables — every workspace-specific value lives here (CUSTOMER SETUP).
+# Defaults are intentionally BLANK: set them per target below, or override on the
+# CLI (`databricks bundle deploy --var catalog=main ...`), or in a gitignored
+# databricks.local.yml. See README "Setup" for the full list.
+# =============================================================================
+variables:
+  # ---- App state plane (Lakebase + audit) ----
+  catalog:
+    description: UC catalog holding PAVE's own audit/asset-registry Delta tables (e.g. main)
+    default: ""
+  schema:
+    description: Schema (within catalog) for PAVE audit + asset-registry mirror
+    default: pave
+  warehouse_id:
+    description: SQL warehouse ID the app uses for FinOps/system-table queries
+    default: ""
+  lakebase_instance_name:
+    description: Lakebase (managed Postgres) instance for PAVE operational state
+    default: ""
+
+  # ---- Provisioning target plane (what PAVE vends into) ----
+  parent_catalog:
+    description: Default parent UC catalog into which approved schemas are provisioned
+    default: ""
+  default_cluster_policy_id:
+    description: Cluster policy ID referenced by policy-bound (sim) cluster requests
+    default: ""
+
+  # ---- Identities ----
+  provisioner_sp:
+    description: Service principal the provisioning Job runs as (privileged; SoD boundary). Empty = run as deploying user.
+    default: ""
+  app_service_principal_app_id:
+    description: OAuth client_id of the deployed app SP (find via `databricks apps get pave` after first deploy)
+    default: ""
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      # SETUP: your Databricks workspace URL, e.g. https://<workspace>.cloud.databricks.com
+      host: https://<your-workspace-host>
+    presets:
+      name_prefix: "[dev ${workspace.current_user.short_name}] "
+      trigger_pause_status: PAUSED
+      jobs_max_concurrent_runs: 1
+    variables:
+      # SETUP: set your catalog(s); schema is namespaced per developer by default.
+      catalog: ""
+      schema: pave_${workspace.current_user.short_name}
+      parent_catalog: ""
+    permissions:
+      - user_name: ${workspace.current_user.userName}
+        level: CAN_MANAGE
+
+  prod:
+    mode: production
+    workspace:
+      # SETUP: your Databricks workspace URL.
+      host: https://<your-workspace-host>
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    presets:
+      name_prefix: ""
+      trigger_pause_status: UNPAUSED
+    variables:
+      # SETUP: set your production catalog(s).
+      catalog: ""
+      schema: pave
+      parent_catalog: ""
+    permissions:
+      - user_name: ${workspace.current_user.userName}
+        level: CAN_MANAGE

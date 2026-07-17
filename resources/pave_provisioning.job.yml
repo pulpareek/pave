@@ -1,0 +1,57 @@
+# =============================================================================
+# PAVE Provisioning Job (serverless) — the provisioning engine
+# =============================================================================
+# Triggered by the app (run_now with job parameters) when a request is approved
+# or a decommission/reassignment is requested. Runs as the PROVISIONER service
+# principal (privileged) to enforce separation of duties: the app SP can submit;
+# only this job can create/destroy.
+#
+# NOTE: For a robust demo the engine can ALSO run in-process inside the FastAPI
+# backend (PROVISION_MODE=inprocess). This Job is the production-hardened SoD
+# path (PROVISION_MODE=job). Both call the same backend.services.provisioning_service.
+#
+# Modes (job parameter `action`): provision | decommission | reassign
+# =============================================================================
+
+resources:
+  jobs:
+    pave_provisioning_job:
+      name: pave_provisioning_job
+
+      # Let the app SP trigger this job without overriding its permissions on deploy.
+      permissions:
+        - level: CAN_MANAGE_RUN
+          service_principal_name: ${resources.apps.pave.service_principal_client_id}
+
+      # Separation of duties: provisioning runs as a privileged SP, not the app
+      # SP or the requester. Leave run_as commented until a provisioner SP exists.
+      # run_as:
+      #   service_principal_name: ${var.provisioner_sp}
+
+      parameters:
+        - name: action
+          default: provision
+        - name: request_id
+          default: ""
+        - name: catalog
+          default: ${var.catalog}
+        - name: schema
+          default: ${var.schema}
+        - name: parent_catalog
+          default: ${var.parent_catalog}
+        - name: lakebase_instance
+          default: ${var.lakebase_instance_name}
+
+      tasks:
+        - task_key: provision
+          spark_python_task:
+            python_file: ../src/app/provision_runner.py
+          environment_key: default
+
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "3"
+            dependencies:
+              - databricks-sdk>=0.40.0
+              - asyncpg>=0.29.0

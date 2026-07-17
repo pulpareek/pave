@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PAVE — Platform Asset Vending Engine</title>
+  <link rel="stylesheet" href="/assets/styles.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg width="30" height="30" viewBox="0 0 32 32" fill="none">
+            <rect x="2"  y="2"  width="12" height="12" rx="2" fill="#FF3621"/>
+            <rect x="18" y="2"  width="12" height="12" rx="2" fill="#1B3139"/>
+            <rect x="2"  y="18" width="12" height="12" rx="2" fill="#1B3139"/>
+            <rect x="18" y="18" width="12" height="12" rx="2" fill="#FF3621"/>
+          </svg>
+        </span>
+        <span class="brand-text">
+          <span class="brand-name">PAVE</span>
+          <span class="brand-sub">Platform Asset Vending Engine</span>
+        </span>
+      </div>
+
+      <nav class="nav">
+        <button data-view="intake" class="tab active">
+          <svg viewBox="0 0 24 24" class="ico"><path d="M12 5v14M5 12h14"/></svg> Intake
+        </button>
+        <button data-view="approvals" class="tab">
+          <svg viewBox="0 0 24 24" class="ico"><path d="M20 6L9 17l-5-5"/></svg> Approvals
+        </button>
+        <button data-view="registry" class="tab">
+          <svg viewBox="0 0 24 24" class="ico"><path d="M4 7h16M4 12h16M4 17h16"/></svg> Registry &amp; Ownership
+        </button>
+        <button data-view="governance" class="tab">
+          <svg viewBox="0 0 24 24" class="ico"><path d="M12 3l8 4v5c0 5-3.5 7.5-8 9-4.5-1.5-8-4-8-9V7z"/></svg> Governance
+        </button>
+        <button data-view="finops" class="tab">
+          <svg viewBox="0 0 24 24" class="ico"><path d="M4 19V5M4 19h16M8 16v-5M13 16V8M18 16v-3"/></svg> FinOps &amp; WAF
+        </button>
+      </nav>
+
+      <div class="sidebar-foot">
+        <label>Acting as</label>
+        <select id="persona">
+          <option value="requester">Lead developer (requester)</option>
+          <option value="platform">Platform approver</option>
+          <option value="compliance">Security &amp; compliance</option>
+        </select>
+        <div class="byline">Governed self-service on Databricks</div>
+      </div>
+    </aside>
+
+    <div class="main-wrap">
+      <header class="topbar">
+        <div class="env-badge" id="env-badge"><span class="dot"></span> Databricks workspace</div>
+        <div class="topbar-spacer"></div>
+        <div class="tagline">Guardrails, not gatekeeping — days into minutes</div>
+      </header>
+      <main id="app">
+        <section id="view-intake" class="view"></section>
+        <section id="view-approvals" class="view hidden"></section>
+        <section id="view-registry" class="view hidden"></section>
+        <section id="view-governance" class="view hidden"></section>
+        <section id="view-finops" class="view hidden"></section>
+      </main>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+  <div id="modal" class="modal-backdrop hidden">
+    <div class="modal">
+      <div class="flex"><h3 id="modal-title" style="margin:0">Detail</h3>
+        <button class="right btn ghost small" id="modal-close">Close</button></div>
+      <pre id="modal-body" class="modal-body mono"></pre>
+    </div>
+  </div>
+  <script src="/assets/app.js"></script>
+</body>
+</html>

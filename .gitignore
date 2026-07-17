@@ -1,0 +1,41 @@
+.databricks/
+build/
+dist/
+__pycache__/
+*.egg-info
+*.pyc
+.venv/
+.venv-test/
+
+# OS / editor cruft
+.DS_Store
+.vscode/
+
+# Local workspace-specific bundle overrides (never commit real ids/hosts)
+databricks.local.yml
+*.local.sh
+*.local.md
+*.local.yaml
+
+# Claude Code — excluded entirely from this PUBLIC repo (personal/internal config)
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+
+# Internal-only docs — never publish (see docs/PUBLIC_EXPORT.md for the rationale)
+docs/PUBLIC_EXPORT.md
+docs/DEMO_SCRIPT.md
+docs/BEST_PRACTICES.md
+docs/DESIGN_DECISIONS.md
+docs/*.pdf
+
+# Env files (keep the example)
+.env
+.env.*
+!.env.example
+env.local
+
+scratch/**
+!scratch/README.md
+**/explorations/**
+**/!explorations/README.md

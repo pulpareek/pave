@@ -1,0 +1,128 @@
+# PAVE — Databricks Apps runtime config.
+# Uploaded as-is by DABs (no ${var.x} substitution here).
+#
+# The bound `database` resource auto-injects PGHOST/PGPORT/PGDATABASE/PGUSER/
+# PGSSLMODE. Do NOT map those via valueFrom here.
+
+command: ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+env:
+  # ---- App identity / behavior ----
+  - name: "PGAPPNAME"
+    value: "pave"
+  # Demo persona switcher (X-Pave-Persona) for requester/approver/compliance roles.
+  # Set to "0" in a hardened deploy so role derives only from real identity/groups.
+  - name: "DEMO_PERSONAS"
+    value: "1"
+  - name: "ENVIRONMENT"
+    value: "production"
+  - name: "LOG_LEVEL"
+    value: "INFO"
+
+  # Lakebase schema PAVE owns for operational state
+  - name: "PAVE_SCHEMA"
+    value: "pave"
+
+  # Lakebase instance (for generate_database_credential token refresh)
+  # REQUIRED FOR PERSISTENCE: this value is NOT filled by the bundle var — app.yaml is
+  # uploaded as-is (no ${var} substitution). If left blank, the app cannot mint a Lakebase
+  # token and SILENTLY falls back to in-memory demo_mode (all data lost on restart). Set it
+  # to your Lakebase instance name to persist requests/approvals/registry.
+  - name: "LAKEBASE_INSTANCE"
+    value: ""
+
+  # ---- Provisioning target plane ----
+  # Default parent catalog approved schemas are vended into
+  # SETUP: set to the UC catalog PAVE should provision into (e.g. main).
+  - name: "PARENT_CATALOG"
+    value: ""
+
+  # ---- Compute governance: company cluster policy (auto-attached to vended clusters) ----
+  - name: "COMPANY_CLUSTER_POLICY_NAME"
+    value: "PAVE Standard"
+  # Set to an explicit policy id to reference an existing policy; empty = create-if-missing
+  - name: "COMPANY_CLUSTER_POLICY_ID"
+    value: ""
+
+  # ---- AI gateway provisioning ----
+  # Secret scope/key holding an external-model provider API key (optional; for
+  # external-model gateway endpoints). Empty = use Databricks-hosted FM or model only.
+  - name: "AI_GATEWAY_SECRET_SCOPE"
+    value: ""
+  - name: "AI_GATEWAY_SECRET_KEY"
+    value: ""
+
+  # UC catalog/schema for PAVE's audit + asset-registry Delta mirror
+  # SETUP: set AUDIT_CATALOG to your UC catalog (e.g. main).
+  - name: "AUDIT_CATALOG"
+    value: ""
+  - name: "AUDIT_SCHEMA"
+    value: "pave"
+
+  # Warehouse for FinOps / system.billing.usage + audit Delta writes
+  - name: "DATABRICKS_WAREHOUSE_ID"
+    valueFrom: "sql-warehouse"
+
+  # ---- Provisioning engine ----
+  # inprocess = run the engine inside the backend (robust demo default)
+  # job       = trigger the serverless provisioning Job (SoD-hardened path)
+  - name: "PROVISION_MODE"
+    value: "inprocess"
+
+  # Provisioning Job ID (used when PROVISION_MODE=job)
+  - name: "PROVISIONING_JOB_ID"
+    valueFrom: "provisioning-job"
+
+  # Per-resource real|simulated mechanism overrides (JSON). Empty = use defaults
+  # in backend/providers/registry.py (schema real; AI real-capable; cluster/lakebase sim).
+  - name: "PROVIDER_MODES"
+    value: ""
+
+  # ---- Safety kill-switch ----
+  # Real providers only run when this is 1/true. Default OFF so a deploy never mutates the
+  # workspace until you opt in (everything degrades to simulated). Set to "1" to enable.
+  - name: "PAVE_ALLOW_REAL"
+    value: "0"
+
+  # ---- Approval notifications (email + deep-link) ----
+  # APPROVERS = who can approve AND who is emailed (comma-separated). Empty = no email sent
+  # and approval is group-based only (pave-approvers / platform-admins).
+  - name: "APPROVERS"
+    value: ""
+  # Base URL of THIS deployed app, so approval emails carry an absolute deep-link
+  # (e.g. https://pave-<id>.aws.databricksapps.com). Empty = a relative #approvals/{id}.
+  - name: "APP_URL"
+    value: ""
+  # SMTP relay — Databricks Apps have NO built-in email. Mail only SENDS when SMTP_HOST is
+  # set; otherwise PAVE simulates (logs + audits) the notification. All optional.
+  - name: "SMTP_HOST"
+    value: ""
+  - name: "SMTP_PORT"
+    value: "587"
+  - name: "SMTP_USER"
+    value: ""
+  - name: "SMTP_PASSWORD"
+    value: ""
+  - name: "SMTP_FROM"
+    value: "pave-noreply@databricks.com"
+  - name: "SMTP_USE_TLS"
+    value: "1"
+
+  # ---- Multi-workspace routing + external storage (optional) ----
+  # Comma-separated target workspace hosts the intake picker offers (beyond "this workspace").
+  # Empty = provision only into the app's own workspace. See docs/ADMIN_CAPABILITIES.md.
+  - name: "PAVE_TARGET_WORKSPACES"
+    value: ""
+  # Comma-separated pre-approved UC external location NAMES for external catalogs/schemas
+  # (never raw s3://). Empty = only managed storage is offered.
+  - name: "PAVE_EXTERNAL_LOCATIONS"
+    value: ""
+  # UC metastore id to attach to a newly-vended workspace (account-level bootstrap).
+  - name: "METASTORE_ID"
+    value: ""
+
+  # ---- Intake co-pilot ----
+  # Foundation Model serving endpoint the NL intake co-pilot calls (heuristic fallback if
+  # unavailable). Default databricks-claude-sonnet-4; set to a model available in your workspace.
+  - name: "LLM_ENDPOINT"
+    value: "databricks-claude-sonnet-4"

@@ -1,0 +1,19 @@
+# =============================================================================
+# Lakebase (managed Postgres) for PAVE operational state
+# =============================================================================
+# PAVE binds to an EXISTING Lakebase instance (set var.lakebase_instance_name)
+# rather than provisioning a new one via DABs (a database_instance bills from
+# creation). The app binds to it as the `database` resource in pave_app.app.yml;
+# PAVE creates its own schema (`pave`) on first startup.
+#
+# To provision a dedicated instance instead, uncomment below and set
+# var.lakebase_instance_name to its name:
+#
+# resources:
+#   database_instances:
+#     pave_db:
+#       name: pave-db
+#       capacity: CU_1
+# =============================================================================
+
+resources: {}
