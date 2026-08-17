@@ -1,0 +1,62 @@
+{
+  "use_case_name": "Oncology Trial Data Mart",
+  "project_name": "onco-trial-rwe",
+  "description": "Curated real-world-evidence data mart for the ONC-204 oncology trial cohort, feeding safety signal review and biostatistics analysis.",
+  "justification": "Replaces a 4-day ServiceNow request per study. Consolidates site, EDC and claims extracts into one governed schema so biostatistics can start analysis in the same sprint.",
+  "owner_group": "dbx-clinical-stage-rw",
+  "business_owner": "maya.chandra@lifesci.example",
+  "technical_lead": "dev.lead@lifesci.example",
+  "business_domain": "clinical",
+  "business_function": "clinical_data_management",
+  "business_sub_function": "data_review",
+  "department": "clinical-dev",
+  "data_classification": "restricted",
+  "environment": "stage",
+  "region": "us-east-1",
+  "data_retention": "gxp-retention",
+  "compliance_scope": [
+    "gxp",
+    "hipaa"
+  ],
+  "gxp_relevant": true,
+  "contains_phi": true,
+  "validated_system": true,
+  "cost_center": "CC-2034",
+  "cost_type": "opex",
+  "budget_monthly_cap": 1500,
+  "wbs_code": "WBS-ONC.204",
+  "lifecycle_stage": "pilot",
+  "sla_tier": "tier2",
+  "source_systems": [
+    "Veeva Vault",
+    "Medidata Rave"
+  ],
+  "consumed_by": [
+    "proj-safety-signal"
+  ],
+  "change_ref": "CHG0041288",
+  "jira_epic": "CLIN-1042",
+  "custom_tags": {
+    "application": "onco-rwe",
+    "criticality": "high"
+  },
+  "resources": [
+    {
+      "type": "schema",
+      "config": {
+        "comment": "Curated ONC-204 RWE tables"
+      }
+    },
+    {
+      "type": "cluster",
+      "config": {
+        "compute_mode": "serverless"
+      }
+    }
+  ],
+  "acknowledgements": [
+    "cost-ownership",
+    "data-handling",
+    "phi-handling"
+  ]
+}

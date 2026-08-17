@@ -60,15 +60,33 @@ POLICY_FAMILY: dict[str, dict] = {
         "autoscale.max_workers": {"type": "range", "maxValue": 4, "defaultValue": 2},
         **_BASE_TAGS,
     },
-    # Dev sandbox: cheapest, single small node, aggressive auto-termination.
+    # Dev sandbox: cheapest, tiny autoscale (1 node), aggressive auto-termination.
+    # NOTE: kept autoscale-shaped (not single-node num_workers=0) so every policy in the
+    # family has the same worker shape — a single-node policy would force the create to send
+    # num_workers + single-node spark_confs, diverging from the autoscale create path and
+    # tripping "num_workers must be present" policy validation.
     "PAVE Dev-Cheap": {
         "autotermination_minutes": {"type": "fixed", "value": 15, "hidden": False},
         "dbus_per_hour": {"type": "range", "maxValue": 15},
         "node_type_id": {"type": "fixed", "value": "m5d.large"},
-        "num_workers": {"type": "fixed", "value": 0},   # single-node
+        "autoscale.min_workers": {"type": "fixed", "value": 1, "hidden": True},
+        "autoscale.max_workers": {"type": "range", "maxValue": 2, "defaultValue": 1},
         **_BASE_TAGS,
     },
 }
+
+
+def policy_sizing(policy_name: str = POLICY_NAME) -> dict:
+    """Derive the worker shape the given policy enforces, from the SAME definition the policy
+    is created with — so the cluster create can't drift from the policy and trip
+    'value must be present' validation. Returns {min_workers, max_workers} (the autoscale
+    bounds; the create clamps its requested size into this range)."""
+    d = POLICY_FAMILY.get(policy_name, POLICY_FAMILY[POLICY_NAME])
+    mn = d.get("autoscale.min_workers", {}) or {}
+    mx = d.get("autoscale.max_workers", {}) or {}
+    min_w = int(mn.get("value", mn.get("defaultValue", 1)))
+    max_w = int(mx.get("defaultValue", mx.get("maxValue", 4)))
+    return {"min_workers": min_w, "max_workers": int(mx.get("maxValue", max_w))}
 
 
 def policy_for_request(data_classification: str | None, environment: str | None) -> str:

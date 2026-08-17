@@ -34,20 +34,53 @@ def _resolve_job_id() -> Optional[str]:
     return None
 
 
+def _policy_params() -> dict:
+    """The app's live provisioning policy, forwarded so the Job runs with the SAME config
+    (real modes, target catalog, Lakebase) as the app that triggered it. Every key here must
+    be a declared job parameter (see resources/pave_provisioning.job.yml)."""
+    return {
+        "allow_real": "1" if config.ALLOW_REAL else "0",
+        "provider_modes": config.PROVIDER_MODES or "",
+        "parent_catalog": config.PARENT_CATALOG or "",
+        "audit_catalog": config.AUDIT_CATALOG or "",
+        "lakebase_instance": config.LAKEBASE_INSTANCE or "",
+        "warehouse_id": config.WAREHOUSE_ID or "",   # budget SQL Alert runs on this warehouse
+    }
+
+
 async def trigger_provisioning_job(request_id: str, action: str = "provision") -> str:
     job_id = _resolve_job_id()
     if not job_id:
         raise RuntimeError("PROVISIONING_JOB_ID not configured and job not found by name")
+    job_params = {"action": action, "request_id": request_id, **_policy_params()}
 
     def _run():
-        resp = _client_().jobs.run_now(
-            job_id=int(job_id),
-            job_parameters={"action": action, "request_id": request_id},
-        )
+        resp = _client_().jobs.run_now(job_id=int(job_id), job_parameters=job_params)
         return str(resp.run_id)
 
     run_id = await asyncio.to_thread(_run)
     logger.info("triggered provisioning job run %s (%s, request %s)", run_id, action, request_id)
+    return run_id
+
+
+async def trigger_add_resources_job(request_id: str, resources: list) -> str:
+    """Trigger the Job to provision a DELTA of net-new resources (action=add_resources).
+    The resource list rides along as a JSON job parameter; the runner parses it and calls
+    provision_resources(). Same policy passthrough as a full provision."""
+    import json
+    job_id = _resolve_job_id()
+    if not job_id:
+        raise RuntimeError("PROVISIONING_JOB_ID not configured and job not found by name")
+    job_params = {"action": "add_resources", "request_id": request_id,
+                  "resources": json.dumps(resources), **_policy_params()}
+
+    def _run():
+        resp = _client_().jobs.run_now(job_id=int(job_id), job_parameters=job_params)
+        return str(resp.run_id)
+
+    run_id = await asyncio.to_thread(_run)
+    logger.info("triggered add_resources job run %s (request %s, %d resource(s))",
+                run_id, request_id, len(resources))
     return run_id
 
 

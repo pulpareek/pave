@@ -30,6 +30,26 @@ async function api(path, opts = {}) {
   return body;
 }
 
+// Everything that reaches innerHTML from the API goes through esc(). Requesters control
+// justification text, resource names and tag values, and approvers render them in a
+// privileged session — so unescaped interpolation there is stored XSS aimed at approvers.
+function esc(v) {
+  if (v === null || v === undefined) return "";
+  return String(v)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+// Parse a timestamp that may be an epoch (seconds or ms) OR an ISO string. Lakebase's
+// TIMESTAMPTZ serializes to ISO, while demo mode uses time.time() floats — the old
+// `v * 1000` math turned ISO strings into NaN ("Invalid Date"). Returns a Date or null.
+function toDate(v) {
+  if (v === null || v === undefined || v === "") return null;
+  if (typeof v === "number") return new Date(v > 1e12 ? v : v * 1000);
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? null : d;
+}
+
 function toast(msg, ok = true) {
   const t = document.getElementById("toast");
   t.textContent = msg;
@@ -48,13 +68,230 @@ function showModal(title, body) {
   document.getElementById("modal-body").textContent = body;
   document.getElementById("modal").classList.remove("hidden");
 }
-const tierPill = (t) => `<span class="pill ${String(t || "").toLowerCase()}">${t || "-"}</span>`;
-const modePill = (m) => `<span class="pill ${m}">${m}</span>`;
+
+// Show full request detail in modal (for approvals, registry, governance)
+async function showRequestDetail(requestId) {
+  try {
+    const request = await api(`/api/requests/${requestId}`);
+    const fmt = (v) => v === null || v === undefined || v === "" ? "—" : esc(String(v));
+    const yes = (v) => v ? "✓" : "—";
+    const arr = (v) => Array.isArray(v) && v.length ? v.map(esc).join(", ") : "—";
+
+    let html = `<div style="font-size:13px; line-height:1.6">
+      <h4 style="margin:12px 0 8px 0; border-bottom:1px solid var(--line); padding-bottom:6px">Request</h4>
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px 20px; margin-bottom:14px">
+        <div><b>ID:</b> ${fmt(request.project_id)}</div>
+        <div><b>Use case:</b> ${fmt(request.use_case_name)}</div>
+        <div><b>Asset name:</b> ${fmt(request.project_name)}</div>
+        <div><b>Requester:</b> ${fmt(request.requester)}</div>
+        <div><b>Business owner:</b> ${fmt(request.business_owner)}</div>
+        <div><b>Owner group:</b> ${fmt(request.owner_group)}</div>
+        <div><b>Technical lead:</b> ${fmt(request.technical_lead)}</div>
+        <div><b>Backup owner:</b> ${fmt(request.backup_owner)}</div>
+        <div><b>Support / on-call:</b> ${fmt(request.support_contact)}</div>
+        <div><b>Department:</b> ${fmt(request.department)}</div>
+      </div>
+
+      <h4 style="margin:12px 0 8px 0; border-bottom:1px solid var(--line); padding-bottom:6px">Governance &amp; compliance</h4>
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px 20px; margin-bottom:14px">
+        <div><b>Data classification:</b> ${fmt(request.data_classification)}</div>
+        <div><b>Environment:</b> ${fmt(request.environment)}</div>
+        <div><b>SLA tier:</b> ${fmt(request.sla_tier)}</div>
+        <div><b>Lifecycle stage:</b> ${fmt(request.lifecycle_stage)}</div>
+        <div><b>RTO (hours):</b> ${fmt(request.rto_hours)}</div>
+        <div><b>RPO (hours):</b> ${fmt(request.rpo_hours)}</div>
+        <div><b>Data retention:</b> ${fmt(request.data_retention)}</div>
+        <div><b>Sunset date:</b> ${fmt(request.sunset_date)}</div>
+        <div><b>Compliance scope:</b> ${arr(request.compliance_scope)}</div>
+        <div><b>GxP relevant:</b> ${yes(request.gxp_relevant)}</div>
+        <div><b>Contains PHI:</b> ${yes(request.contains_phi)}</div>
+        <div><b>Validated system:</b> ${yes(request.validated_system)}</div>
+        <div><b>Security review:</b> ${fmt(request.security_review_status)}</div>
+        <div><b>DPIA ref:</b> ${fmt(request.dpia_ref)}</div>
+      </div>
+
+      <h4 style="margin:12px 0 8px 0; border-bottom:1px solid var(--line); padding-bottom:6px">Cost &amp; ownership</h4>
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px 20px; margin-bottom:14px">
+        <div><b>Cost center:</b> ${fmt(request.cost_center)}</div>
+        <div><b>Cost type:</b> ${fmt(request.cost_type)}</div>
+        <div><b>Monthly budget cap:</b> ${fmt(request.budget_monthly_cap)}</div>
+        <div><b>WBS code:</b> ${fmt(request.wbs_code)}</div>
+        <div><b>Business domain:</b> ${fmt(request.business_domain)}</div>
+        <div><b>Business function:</b> ${fmt(request.business_function)}</div>
+      </div>
+
+      <h4 style="margin:12px 0 8px 0; border-bottom:1px solid var(--line); padding-bottom:6px">Justification</h4>
+      <p style="font-style:italic; margin:8px 0; color:var(--muted)">${fmt(request.justification)}</p>
+      <p style="margin:8px 0">${fmt(request.description)}</p>
+
+      ${(request.resources || []).length ? `
+        <h4 style="margin:12px 0 8px 0; border-bottom:1px solid var(--line); padding-bottom:6px">Resources (${request.resources.length})</h4>
+        <div style="margin-bottom:14px">
+          ${(request.resources || []).map((r, i) => {
+            const cfg = r.config || {};
+            const cfgEntries = Object.entries(cfg).filter(([k, v]) => v !== null && v !== undefined && v !== "");
+            return `<div style="background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:10px; margin-bottom:8px">
+              <b>${fmt(r.type)}</b>${cfgEntries.length ? `<div style="font-size:12px; margin-top:6px">
+                ${cfgEntries.map(([k, v]) => `<div><span class="mono">${esc(k)}</span>: ${fmt(JSON.stringify(v))}</div>`).join("")}
+              </div>` : ""}
+            </div>`;
+          }).join("")}
+        </div>
+      ` : ""}
+
+      ${(request.assets || []).length ? `
+        <h4 style="margin:12px 0 8px 0; border-bottom:1px solid var(--line); padding-bottom:6px">Provisioned assets (${request.assets.length})</h4>
+        <div style="margin-bottom:14px">
+          ${(request.assets || []).map(a => `
+            <div style="background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:8px; margin-bottom:6px; font-size:12px">
+              <span class="mono">${fmt(a.external_id)}</span> · ${fmt(a.type)} · ${modePill(a.mode)} · <span class="pill">${fmt(a.status)}</span>
+              ${a.applied_tags ? `<div style="margin-top:6px">${tagsHtml(a.applied_tags)}</div>` : ""}
+            </div>
+          `).join("")}
+        </div>
+      ` : ""}`;
+
+    // ---- routing & risk (why it was tiered the way it was) ----
+    const routing = request.routing || (request.metadata || {}).routing || {};
+    if (routing.risk_tier || (routing.rationale || []).length) {
+      html += `<h4 style="margin:12px 0 8px 0; border-bottom:1px solid var(--line); padding-bottom:6px">Routing &amp; risk</h4>
+        <div style="margin-bottom:6px">${tierPill(routing.risk_tier || request.risk_tier)}
+          <span class="pill">${fmt(routing.change_type || (request.metadata || {}).change_type)} change</span>
+          ${(routing.gates || []).map(g => `<span class="kv">${esc(g)}</span>`).join("")}</div>
+        ${(routing.rationale || []).length ? `<ul style="font-size:12px; margin:6px 0 14px 18px; color:var(--muted)">
+          ${(routing.rationale || []).map(x => `<li>${esc(x)}</li>`).join("")}</ul>` : ""}`;
+    }
+
+    // ---- approvals & e-signatures (with the stored decision comment) ----
+    const apps = request.approvals || [];
+    if (apps.length) {
+      html += `<h4 style="margin:12px 0 8px 0; border-bottom:1px solid var(--line); padding-bottom:6px">Approvals &amp; e-signatures (${apps.length})</h4>
+        <div style="margin-bottom:14px">
+          ${apps.map(a => {
+            const sig = a.signature || {};
+            const wd = toDate(a.signed_at); const when = wd ? wd.toLocaleString() : "";
+            return `<div style="background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:10px; margin-bottom:8px; font-size:12px">
+              <div><b>${a.decision === "approve" ? "✓ Approved" : "✗ Rejected"}</b> · gate <span class="kv">${fmt(a.gate)}</span> · ${fmt(a.approver)} ${when ? `· ${esc(when)}` : ""}</div>
+              <div style="margin-top:4px"><b>Signed:</b> ${fmt(a.esignature)}</div>
+              <div style="margin-top:4px"><b>Comment:</b> <span style="font-style:italic">${fmt(a.reason)}</span></div>
+              ${sig.digest ? `<div class="mono muted" style="margin-top:4px; font-size:11px">manifest ${esc(String(sig.digest).slice(0, 24))}…</div>` : ""}
+            </div>`;
+          }).join("")}
+        </div>`;
+    }
+
+    // ---- lineage & references ----
+    const refs = [["Source systems", request.source_systems], ["Consumed by", request.consumed_by],
+                  ["Depends on", request.depends_on]];
+    const refLine = [["Change ref", request.change_ref], ["ServiceNow", request.servicenow_ref],
+                     ["Jira", request.jira_epic], ["Confluence", request.confluence_url]]
+                    .filter(([, v]) => v);
+    if (refs.some(([, v]) => (v || []).length) || refLine.length) {
+      html += `<h4 style="margin:12px 0 8px 0; border-bottom:1px solid var(--line); padding-bottom:6px">Lineage &amp; references</h4>
+        <div style="font-size:12px; margin-bottom:14px">
+          ${refs.filter(([, v]) => (v || []).length).map(([k, v]) => `<div><b>${k}:</b> ${arr(v)}</div>`).join("")}
+          ${refLine.map(([k, v]) => `<div><b>${k}:</b> ${fmt(v)}</div>`).join("")}
+        </div>`;
+    }
+
+    // ---- audit timeline ----
+    let audit = [];
+    try { audit = await api(`/api/requests/${requestId}/audit`); } catch (e) { /* non-fatal */ }
+    if (audit.length) {
+      html += `<h4 style="margin:12px 0 8px 0; border-bottom:1px solid var(--line); padding-bottom:6px">Audit trail (${audit.length})</h4>
+        <div style="font-size:12px; margin-bottom:14px">
+          ${audit.map(e => {
+            const td = toDate(e.at || e.created_at || e.signed_at); const ts = td ? td.toLocaleString() : "";
+            return `<div class="audit-ev"><span class="kv">${esc(e.event_type)}</span> ${esc(e.actor || "")} ${ts ? `· ${esc(ts)}` : ""}${e.reason ? ` — ${esc(e.reason)}` : ""}</div>`;
+          }).join("")}
+        </div>`;
+    }
+
+    // ---- actions (persona / status aware) ----
+    const st = request.status;
+    const canRetry = st === "FAILED" || st === "PARTIAL";
+    html += `<h4 style="margin:12px 0 8px 0; border-bottom:1px solid var(--line); padding-bottom:6px">Actions</h4>
+      <div class="row" style="gap:10px; flex-wrap:wrap">
+        <button class="btn small" id="act-amend">Amend / new change request</button>
+        ${canRetry ? `<button class="btn ghost small" id="act-retry">Retry failed resources</button>` : ""}
+        <button class="btn ghost small" id="act-spec">View as-code spec</button>
+      </div>
+      <p class="muted" style="font-size:11px; margin-top:8px">Amend re-opens this request in the intake form to edit any field; submitting re-tags the project's assets and provisions net-new resources (approver + e-signature). Decommission lives in Registry &amp; Ownership.</p>
+    </div>`;
+
+    const modal = document.getElementById("modal");
+    document.getElementById("modal-title").textContent = `Request · ${fmt(request.project_id)}`;
+    const body = document.getElementById("modal-body");
+    body.innerHTML = html;
+    body.style.whiteSpace = "normal";
+    modal.classList.remove("hidden");
+
+    body.querySelector("#act-amend").onclick = () => openAmend(request);
+    const specBtn = body.querySelector("#act-spec");
+    if (specBtn) specBtn.onclick = async () => {
+      try { const r = await api(`/api/requests/${requestId}/spec`); showModal(`As-code spec · ${fmt(request.project_id)}`, r.yaml); }
+      catch (e) { toast((e.body && e.body.error) || "spec failed", false); }
+    };
+    const retryBtn = body.querySelector("#act-retry");
+    if (retryBtn) retryBtn.onclick = async () => {
+      try { await api(`/api/requests/${requestId}/retry`, { method: "POST" }); toast("Retrying failed resources…"); modal.classList.add("hidden"); }
+      catch (e) { toast((e.body && e.body.error) || "retry failed", false); }
+    };
+  } catch (e) {
+    toast((e.body && e.body.error) || "Could not load request details", false);
+  }
+}
+
+// Pill classes come from a fixed vocabulary; anything unrecognised renders unclassed so a
+// hostile value can never inject a class (or break out of the attribute).
+const KNOWN_PILLS = ["tier0", "tier1", "tier2", "real", "simulated", "dabs", "degraded"];
+const pill = (value, extraClass = "") => {
+  const key = String(value || "").toLowerCase();
+  const cls = KNOWN_PILLS.includes(key) ? key : "";
+  return `<span class="pill ${cls} ${extraClass}">${esc(value || "-")}</span>`;
+};
+const tierPill = (t) => pill(t);
+const modePill = (m) => pill(m);
 const tagsHtml = (tags) => `<div class="tagset">${Object.entries(tags || {})
-  .map(([k, v]) => `<span class="kv">${k}=${v}</span>`).join("")}</div>`;
+  .map(([k, v]) => `<span class="kv">${esc(k)}=${esc(v)}</span>`).join("")}</div>`;
 
 let OPTS = null, TEMPLATES = [];
 let WORKSPACES = [{ host: "", label: "This workspace (default)", self: true }];
+let POSTURE = null;
+
+// ============================================================ POSTURE BANNER
+// A governed-provisioning demo is only credible if the viewer can tell which resources
+// are really created and which are modelled, before they trust a green ACTIVE.
+async function renderPosture() {
+  const bar = document.getElementById("posture-banner");
+  if (!bar) return;
+  try { POSTURE = await api("/api/meta/posture"); }
+  catch (e) { bar.classList.add("hidden"); return; }
+
+  const p = POSTURE.provisioning, s = POSTURE.storage, id = POSTURE.identity;
+  const notes = [];
+  if (!p.allow_real) {
+    notes.push(`<b>Nothing is created in the workspace.</b> Every resource type is modelled (PAVE_ALLOW_REAL is off).`);
+  } else if (p.real_types.length) {
+    notes.push(`<b>Really created:</b> ${p.real_types.map(esc).join(", ")}. All other types are modelled.`);
+  }
+  if (!s.persistent) notes.push(`<b>In-memory storage.</b> ${esc(s.note)}`);
+  if (id.personas_enabled) notes.push(`<b>Demo identity.</b> ${esc(id.note)}`);
+  if (!p.separation_of_duties) notes.push(`Provisioning runs in-process as the app service principal (no separation of duties).`);
+
+  if (!notes.length) { bar.classList.add("hidden"); return; }
+  bar.className = "posture" + (p.allow_real && s.persistent ? " soft" : "");
+  bar.innerHTML = `<span class="posture-tag">Demo posture</span>
+    <span class="posture-notes">${notes.join(" · ")}</span>
+    <button class="btn ghost small" id="posture-detail">Details</button>`;
+  bar.querySelector("#posture-detail").onclick = () => {
+    const lines = Object.entries(p.by_type).map(([t, v]) =>
+      `${t.padEnd(22)} ${v.mode.padEnd(10)} ${v.explanation}`).join("\n");
+    showModal("What this deployment actually does",
+      `environment: ${POSTURE.environment}\nidentity:    ${id.source}\n` +
+      `storage:     ${s.backend}\nprovisioning:${p.mode} (allow_real=${p.allow_real})\n\n${lines}`);
+  };
+}
 
 // ===================================================================== INTAKE
 const STEPS = [
@@ -160,11 +397,13 @@ function renderIntake() {
   document.getElementById("step-next").onclick = nextStep;
   document.getElementById("step-preview").onclick = previewCost;
   document.getElementById("step-submit").onclick = submitIntake;
+  loadOwnerGroups();
   // live validation + completion %
   wrap.addEventListener("input", onIntakeInput);
   wrap.addEventListener("change", onIntakeInput);
   refreshAI();
   showStep(0);
+  if (AMEND) injectAmendBanner();   // re-show the amend context if a re-render wiped it
 }
 
 // Currently-required fields (dynamic by tier) -> drives completion % + step checks.
@@ -313,8 +552,10 @@ function stepPanels() {
       </div>
       ${L("Business owner (email)", "Accountable business owner. Distinct from the technical owning group.", true)}
       ${inp("f-business_owner", { type: "email", placeholder: "owner@co.com" })}
-      ${L("Owning AD group", "SCIM-synced AD group that owns this. You must be a member.", true)}
-      ${inp("f-owner_group", { placeholder: "rwe-clinical", maxlength: 80 })}
+      ${L("Owning group (Databricks)", "The Databricks group that owns this and receives the grants. Pick an existing group, or type a new name to have it created.", true)}
+      <input id="f-owner_group" list="owner-group-dl" placeholder="${opt("owner_group_template") || "dbx-<domain>-<env>-<role>"}" maxlength="80" autocomplete="off" /><span class="field-err"></span>
+      <datalist id="owner-group-dl"></datalist>
+      <div id="owner-group-note" class="muted" style="font-size:11px;margin-top:-4px">New-group convention: <code>${opt("owner_group_template") || "dbx-{domain}-{env}-{role}"}</code> (e.g. dbx-clinical-prod-rw)</div>
       <div class="row">
         <div>${L("Technical lead (email)", "Day-to-day technical owner's email.")}${inp("f-technical_lead", { type: "email", placeholder: "lead@co.com" })}</div>
         <div>${L("Backup owner (email)", "Secondary owner (bus-factor). Required for prod / tier1.")}${inp("f-backup_owner", { type: "email", placeholder: "backup@co.com" })}</div>
@@ -335,11 +576,14 @@ function stepPanels() {
         <div>${sel("f-environment", opt("environments"), false, "Lifecycle environment. prod adds change-control gates.", true)}</div>
       </div>
       <div class="row">
+        <div>${sel("f-medallion_layer", opt("medallion_layers"), true, "Medallion layer. Part of the catalog naming convention {domain}_{layer}_{env} (required when creating a catalog).")}</div>
         <div>${sel("f-region", opt("regions"), true, "Data residency region (if multi-region).")}</div>
+      </div>
+      <div class="row">
         <div>${sel("f-data_retention", opt("data_retention_classes"), true, "Retention class. Required for restricted / GxP.")}</div>
       </div>
       ${L("Sunset date", "Auto-decommission reminder. Required for dev/test sandboxes.")}
-      ${inp("f-sunset_date", { type: "date" })}
+      ${inp("f-sunset_date", { type: "date", min: futureDateMin() })}
     </div>
     <div class="card">
       ${L("Compliance scope", "Regulatory frameworks in scope — drives gates + ABAC.")}
@@ -363,7 +607,9 @@ function stepPanels() {
         <div>${sel("f-cost_type", opt("cost_types"), true, "Opex vs Capex (capitalization).")}</div>
       </div>
       <div class="row">
-        <div>${L("Monthly budget cap ($)", "Spend cap; drives alerts. Over $2000 escalates approval.")}${inp("f-budget_monthly_cap", { type: "number", min: 0, placeholder: "2000" })}</div>
+        <div>${L("Monthly budget cap ($)", "Spend cap; drives alerts. Over $2000 escalates approval.")}${inp("f-budget_monthly_cap", { type: "number", min: 0, placeholder: "2000" })}
+          <div id="budget-rec" class="muted" style="font-size:11px;margin-top:4px"></div>
+        </div>
         <div>${L("WBS / chargeback code", "Uppercase letters/digits/.- , 3–30 chars.")}${inp("f-wbs_code", { placeholder: "WBS-1234.5", maxlength: 30, pattern: "^[A-Z0-9][A-Z0-9.\\-]{2,29}$" })}</div>
       </div>
     </div>
@@ -376,7 +622,7 @@ function stepPanels() {
         <div>${L("RTO (hours)", "Recovery Time Objective. Required for prod/tier1.")}${inp("f-rto_hours", { type: "number", min: 0, placeholder: "24" })}</div>
         <div>${L("RPO (hours)", "Recovery Point Objective. Required for prod/tier1.")}${inp("f-rpo_hours", { type: "number", min: 0, placeholder: "4" })}</div>
       </div>
-      ${L("Target go-live date", "Planned production go-live.")}${inp("f-go_live_date", { type: "date" })}
+      ${L("Target go-live date", "Planned production go-live.")}${inp("f-go_live_date", { type: "date", min: futureDateMin() })}
     </div>
   </div></div>
 
@@ -407,7 +653,7 @@ function stepPanels() {
   <div class="step-panel hidden" data-step="4">
     ${placementHtml()}
     ${L("Resources to provision", "Pick the footprint, then configure each below. Restricted data forces single-user clusters; AI assets get governed by the AI Gateway.", true)}
-    <div id="resource-picker" class="grid cols-3" style="margin-top:8px">${opt("resource_types").filter(rt => rt !== "workspace").map(rt =>
+    <div id="resource-picker" class="grid cols-3" style="margin-top:8px">${opt("resource_types").filter(rt => rt !== "workspace" && rt !== "job_cluster").map(rt =>
       `<label class="card click rpick" data-rtype="${rt}">
         <span class="check"><input type="checkbox" class="rtype" value="${rt}"/> <b>${rt}</b></span>
       </label>`).join("")}</div>
@@ -456,6 +702,12 @@ function L(label, h, required) {
   const star = required ? `<span class="req" title="Required">*</span>` : "";
   return `<label class="field">${label}${star}${h ? " " + help(h) : ""}</label>`;
 }
+// Earliest selectable date = tomorrow (dates must always be in the future).
+function futureDateMin() {
+  const d = new Date();
+  d.setDate(d.getDate() + 1);
+  return d.toISOString().slice(0, 10);
+}
 function inp(id, o = {}) {
   const a = [`id="${id}"`];
   if (o.type) a.push(`type="${o.type}"`);
@@ -486,6 +738,17 @@ function selectedResourceTypes() {
   return [...document.querySelectorAll("#resource-picker .rtype:checked")].map(c => c.value);
 }
 
+// The naming-convention template for a resource type (from /api/meta/form-options).
+function namingHint(rt) {
+  const t = opt("naming_templates") || {};
+  return t[rt] || "{domain}-{env}-{short}";
+}
+
+// Radio `name` is document-global, so two panels rendered at once (intake + the
+// add-to-existing-project flow) would share one radio group and silently uncheck each
+// other. Every panel render gets its own scope token.
+let PANEL_SEQ = 0;
+
 // (Re)render one config panel per selected resource into #resource-configs.
 function renderResourceConfigs() {
   const host = document.getElementById("resource-configs");
@@ -494,8 +757,9 @@ function renderResourceConfigs() {
   host.innerHTML = types.length
     ? types.map(rt => `<div class="card rcfg" data-rtype="${rt}">
         <div class="flex"><b>${rt}</b><span class="right muted" style="font-size:11px">configuration</span></div>
-        ${L("Name (optional)", "Override the auto-generated name.")}<input class="rname" maxlength="60" placeholder="auto" />
-        ${resourceConfigHtml(rt)}
+        ${L("Name (optional)", "Override the auto-generated name. Must follow the naming convention below.")}<input class="rname" maxlength="60" placeholder="auto: ${namingHint(rt)}" />
+        <div class="muted" style="font-size:11px;margin-top:-4px">Convention: <code>${namingHint(rt)}</code></div>
+        ${resourceConfigHtml(rt, `p${++PANEL_SEQ}`)}
       </div>`).join("")
     : `<p class="muted" style="font-size:12px">Select one or more resources above to configure them.</p>`;
   refreshAI();
@@ -510,6 +774,11 @@ function onResourceConfigToggle(e) {
   if (t.classList.contains("cat-kind")) {
     panel.querySelector(".cat-ext")?.classList.toggle("hidden",
       panel.querySelector(".cat-kind:checked")?.value !== "external");
+  }
+  if (t.classList.contains("cl-mode")) {
+    const classic = panel.querySelector(".cl-mode:checked")?.value === "classic";
+    panel.querySelector(".cl-classic")?.classList.toggle("hidden", !classic);
+    panel.querySelector(".cl-serverless-note")?.classList.toggle("hidden", classic);
   }
   if (t.classList.contains("cl-sizemode")) {
     const fixed = panel.querySelector(".cl-sizemode:checked")?.value === "fixed";
@@ -552,7 +821,7 @@ function collectCustomTags() {
 }
 
 // The governed option set per resource type (2025-2026 Databricks options).
-function resourceConfigHtml(rt) {
+function resourceConfigHtml(rt, scope = `p${++PANEL_SEQ}`) {
   const locs = opt("pre_approved_locations") || [];
   const locOptions = ["", ...locs];
 
@@ -560,8 +829,8 @@ function resourceConfigHtml(rt) {
     return `
       ${L("Catalog kind", "Managed = Databricks-governed storage (default). External = a pre-approved external location.")}
       <div class="row" style="gap:16px">
-        <label class="check"><input type="radio" name="cat-kind" class="cat-kind" value="managed" checked/> managed</label>
-        <label class="check"><input type="radio" name="cat-kind" class="cat-kind" value="external"/> external</label>
+        <label class="check"><input type="radio" name="cat-kind-${scope}" class="cat-kind" value="managed" checked/> managed</label>
+        <label class="check"><input type="radio" name="cat-kind-${scope}" class="cat-kind" value="external"/> external</label>
       </div>
       <div class="cat-ext hidden">
         ${L("External location", "Pick a pre-approved external location (admin-registered). Never a raw s3:// path.")}
@@ -578,10 +847,10 @@ function resourceConfigHtml(rt) {
       ${L("Comment (optional)", "Describes the schema in Unity Catalog.")}<input class="sc-comment" maxlength="200" placeholder="e.g. curated silver tables" />`;
   }
   if (rt === "cluster") {
-    return computeConfigHtml(true);
+    return computeConfigHtml(true, scope);
   }
   if (rt === "job_cluster") {
-    return computeConfigHtml(false);
+    return computeConfigHtml(false, scope);
   }
   if (rt === "app") {
     const binds = (opt("app_bindable_resources") || []).map(r =>
@@ -596,8 +865,8 @@ function resourceConfigHtml(rt) {
     return `
       ${L("Offering", "Provisioned = FinOps tags + Apps binding (governed default). Autoscaling = scale-to-zero + branching (newer; no billing tags yet).")}
       <div class="row" style="gap:16px">
-        <label class="check"><input type="radio" name="lb-offer" class="lb-offer" value="provisioned" checked/> provisioned</label>
-        <label class="check"><input type="radio" name="lb-offer" class="lb-offer" value="autoscaling"/> autoscaling</label>
+        <label class="check"><input type="radio" name="lb-offer-${scope}" class="lb-offer" value="provisioned" checked/> provisioned</label>
+        <label class="check"><input type="radio" name="lb-offer-${scope}" class="lb-offer" value="autoscaling"/> autoscaling</label>
       </div>
       <div class="row">
         <div>${L("PG version", "Postgres major version.")}${optSelect("lb-pg", opt("pg_versions"), { selected: "16" })}</div>
@@ -649,11 +918,22 @@ function resourceConfigHtml(rt) {
       </div>
       <div class="vs-managed">${L("Embedding model", "Databricks-hosted embedding endpoint (managed embeddings).")}${optSelect("vs-embmodel", opt("embedding_models"))}</div>`;
   }
+  if (rt === "sql_warehouse") {
+    return `
+      <div class="row">
+        <div>${L("Type", "serverless (governed default — instant start, no infra) · pro · classic.")}${optSelect("wh-type", opt("warehouse_types"))}</div>
+        <div>${L("Size", "Cluster size. Larger = more concurrency/throughput + cost. Capped by governance.")}${optSelect("wh-size", opt("warehouse_sizes"), { selected: "Small" })}</div>
+      </div>
+      <div class="row">
+        <div>${L("Auto-stop (mins)", "Idle minutes before the warehouse stops (cost control). Lower = cheaper.")}<input type="number" min="1" max="120" class="wh-autostop" value="10" /></div>
+        <div>${L("Max clusters", "Upper bound for multi-cluster load balancing (scale-out). 1 = no scale-out.")}<input type="number" min="1" max="10" class="wh-maxclusters" value="1" /></div>
+      </div>`;
+  }
   return "";
 }
 
 // Shared cluster / job_cluster config. `interactive` -> all-purpose (has autotermination).
-function computeConfigHtml(interactive) {
+function computeConfigHtml(interactive, scope = `p${++PANEL_SEQ}`) {
   const dbr = optSelect("cl-dbr", opt("dbr_versions"), { selected: "15.4.x-scala2.12" });
   const nodes = optSelect("cl-node", opt("node_types"));
   const engine = optSelect("cl-engine", opt("runtime_engines"));
@@ -668,8 +948,8 @@ function computeConfigHtml(interactive) {
   const sizing = interactive
     ? `${L("Sizing", "Fixed workers or autoscale range.")}
        <div class="row" style="gap:16px;margin-bottom:4px">
-         <label class="check"><input type="radio" name="cl-sizemode" class="cl-sizemode" value="autoscale" checked/> autoscale</label>
-         <label class="check"><input type="radio" name="cl-sizemode" class="cl-sizemode" value="fixed"/> fixed</label>
+         <label class="check"><input type="radio" name="cl-sizemode-${scope}" class="cl-sizemode" value="autoscale" checked/> autoscale</label>
+         <label class="check"><input type="radio" name="cl-sizemode-${scope}" class="cl-sizemode" value="fixed"/> fixed</label>
        </div>
        <div class="cl-autoscale"><div class="row">
          <div>${L("Min workers", "")}<input type="number" min="0" class="cl-min" value="1" /></div>
@@ -677,7 +957,22 @@ function computeConfigHtml(interactive) {
        </div></div>
        <div class="cl-fixed hidden">${L("Workers", "0 = single node.")}<input type="number" min="0" class="cl-workers" value="2" /></div>`
     : `${L("Workers", "Fixed worker count for the job cluster (0 = single node).")}<input type="number" min="0" class="cl-workers" value="2" />`;
-  return `
+  // Compute-mode chooser. Serverless (default) needs NO classic sizing knobs — node type,
+  // DBR, spot, autoscaling all vanish; governance (tags, policy, access) is what still
+  // matters. Classic reveals the full knob set. This makes PAVE's positioning visible:
+  // as compute goes serverless, the vending surface is governance, not machine config.
+  const modeChooser = `
+    ${L("Compute mode", "Serverless = no infra to size (Databricks manages it); PAVE still governs tags, access + lifecycle. Classic = you pick node type / runtime / sizing.")}
+    <div class="row" style="gap:18px;margin-bottom:8px">
+      <label class="check"><input type="radio" name="cl-mode-${scope}" class="cl-mode" value="serverless" checked/> Serverless</label>
+      <label class="check"><input type="radio" name="cl-mode-${scope}" class="cl-mode" value="classic"/> Classic</label>
+    </div>
+    <div class="cl-serverless-note muted" style="font-size:12px;margin-bottom:6px">
+      Serverless: no node type, runtime, or sizing to choose — Databricks manages the compute.
+      PAVE still applies governed tags, the access policy, and lifecycle. Switch to Classic to size infra yourself.
+    </div>`;
+  // The classic-only knobs are wrapped so serverless can hide them wholesale.
+  const classicKnobs = `
     ${access}
     <div class="row">
       <div>${L("Node type", "Fleet types auto-resolve the best instance. Allow-listed for cost.")}${nodes}</div>
@@ -688,6 +983,9 @@ function computeConfigHtml(interactive) {
       <div>${L("Engine", "Photon accelerates SQL/DataFrame workloads.")}${engine}</div>
       ${interactive ? `<div>${autoterm}</div>` : `<div>${spot}</div>`}
     </div>`;
+  return `
+    ${modeChooser}
+    <div class="cl-classic hidden">${classicKnobs}</div>`;
 }
 
 // Tags panel: auto-derived defaults (shown read-only) + user-added allow-listed tags.
@@ -782,6 +1080,7 @@ function showStep(i) {
   document.getElementById("step-next").style.display = last ? "none" : "";
   document.getElementById("step-submit").style.display = last ? "" : "none";
   document.getElementById("step-preview").style.display = last ? "" : "none";
+  if (STEPS[_step] && STEPS[_step].key === "cost") refreshBudgetRec();
   refreshHints();
   updateCompletion();
 }
@@ -838,12 +1137,53 @@ function refreshTaxonomy(which) {
   if (wrap) wrap.classList.toggle("hidden", subs.length === 0);
 }
 
+// Populate the owning-group picker with REAL Databricks groups (Phase A: the app's own
+// workspace). Free-text is still allowed (type a new name -> PAVE creates it), so this is
+// an enhancement, not a hard gate.
+async function loadOwnerGroups() {
+  const dl = document.getElementById("owner-group-dl");
+  const note = document.getElementById("owner-group-note");
+  if (!dl) return;
+  const conv = opt("owner_group_template") || "dbx-{domain}-{env}-{role}";
+  try {
+    const r = await api("/api/meta/groups");
+    dl.innerHTML = (r.groups || []).map(g => `<option value="${g}"></option>`).join("");
+    if (note) note.innerHTML = (r.resolvable && r.groups.length)
+      ? `${r.groups.length} Databricks group(s) — pick one, or type a new name to create it (convention: <code>${conv}</code>).`
+      : `Couldn't load workspace groups — type the group name. New-group convention: <code>${conv}</code>.`;
+  } catch (e) { /* keep free-text fallback + convention note as authored */ }
+}
+
+// Live cost estimate + recommended budget cap on the Cost & Lifecycle step, so the
+// requester sets the cap against a number instead of guessing (addresses the "how do
+// customers know a realistic budget?" ask). Coarse rate-card stand-in until real billing.
+async function refreshBudgetRec() {
+  const el = document.getElementById("budget-rec");
+  if (!el) return;
+  const res = collectResources();
+  if (!res.length) { el.innerHTML = "Add resources (step 5) to get an estimate & a recommended cap."; return; }
+  try {
+    const r = await api("/api/finops/estimate", { method: "POST", body: JSON.stringify({ resources: res }) });
+    const rec = r.recommended_budget || 0;
+    el.innerHTML = `Est. <b>$${r.estimated_monthly}/mo</b> for the selected footprint · recommended cap <b>$${rec}</b> `
+      + `<a href="#" id="budget-use">Use $${rec}</a>`
+      + (r.escalates_on_cost ? ` · <span class="pill tier2">over $${r.budget_threshold} → controlled approval</span>` : "");
+    const use = document.getElementById("budget-use");
+    if (use) use.onclick = (e) => {
+      e.preventDefault();
+      const b = document.getElementById("f-budget_monthly_cap");
+      if (b) { b.value = rec; if (typeof updateCompletion === "function") updateCompletion(); }
+    };
+  } catch (e) { el.textContent = "estimate unavailable (rate-card)"; }
+}
+
 async function previewCost() {
   const out = document.getElementById("cost-out");
   try {
     const r = await api("/api/finops/estimate", { method: "POST",
       body: JSON.stringify({ resources: collectResources() }) });
-    out.innerHTML = `Est. <b>$${r.estimated_monthly}/mo</b>` +
+    const rec = r.recommended_budget ? ` · recommended cap <b>$${r.recommended_budget}</b>` : "";
+    out.innerHTML = `Est. <b>$${r.estimated_monthly}/mo</b>` + rec +
       (r.escalates_on_cost ? ` <span class="pill tier2">over $${r.budget_threshold} → controlled approval</span>` : "");
   } catch (e) { out.textContent = "estimate failed"; }
 }
@@ -878,7 +1218,7 @@ async function draftWithAI() {
     applyDraft(d);
     document.getElementById("cop-src").textContent = "source: " + (d._source || "heuristic");
     document.getElementById("cop-rationale").innerHTML =
-      (d._rationale || []).map(x => `<span class="kv">${x.replace(/\*\*/g, "")}</span>`).join("");
+      (d._rationale || []).map(x => `<span class="kv">${esc(x).replace(/\*\*/g, "")}</span>`).join("");
     toast("Draft ready — step through and submit");
   } catch (e) { toast("Co-pilot failed", false); }
   finally { btn.textContent = "Draft with AI"; btn.disabled = false; }
@@ -939,18 +1279,24 @@ function collectResources() {
       const cm = v(".sc-comment"); if (cm) cfg.comment = cm;
     }
     if (rt === "cluster" || rt === "job_cluster") {
-      cfg.node_type_id = v(".cl-node");
-      cfg.spark_version = v(".cl-dbr");
-      cfg.runtime_engine = v(".cl-engine");
-      if (rt === "cluster") {
-        cfg.access_mode = v(".cl-access");
-        cfg.autotermination_minutes = numv(".cl-autoterm");
-        const mode = c.querySelector(".cl-sizemode:checked")?.value || "autoscale";
-        if (mode === "fixed") { cfg.num_workers = numv(".cl-workers"); }
-        else { cfg.min_workers = numv(".cl-min"); cfg.max_workers = numv(".cl-max"); }
-      } else {
-        cfg.num_workers = numv(".cl-workers");
-        cfg.availability = v(".cl-spot");
+      const computeMode = c.querySelector(".cl-mode:checked")?.value || "serverless";
+      cfg.compute_mode = computeMode;
+      // Serverless: Databricks manages the infra — no node/runtime/sizing knobs to collect.
+      // Governance (tags, access, lifecycle) still applies. Classic collects the full set.
+      if (computeMode === "classic") {
+        cfg.node_type_id = v(".cl-node");
+        cfg.spark_version = v(".cl-dbr");
+        cfg.runtime_engine = v(".cl-engine");
+        if (rt === "cluster") {
+          cfg.access_mode = v(".cl-access");
+          cfg.autotermination_minutes = numv(".cl-autoterm");
+          const mode = c.querySelector(".cl-sizemode:checked")?.value || "autoscale";
+          if (mode === "fixed") { cfg.num_workers = numv(".cl-workers"); }
+          else { cfg.min_workers = numv(".cl-min"); cfg.max_workers = numv(".cl-max"); }
+        } else {
+          cfg.num_workers = numv(".cl-workers");
+          cfg.availability = v(".cl-spot");
+        }
       }
     }
     if (rt === "app") {
@@ -982,6 +1328,12 @@ function collectResources() {
       cfg.monthly_cost_cap_usd = numv(".ai-costcap");
       cfg.inference_logging = !!q(".ai-logging")?.checked;
       cfg.fallbacks = !!q(".ai-fallback")?.checked;
+    }
+    if (rt === "sql_warehouse") {
+      cfg.warehouse_type = v(".wh-type");
+      cfg.cluster_size = v(".wh-size");
+      cfg.auto_stop_mins = numv(".wh-autostop");
+      cfg.max_num_clusters = numv(".wh-maxclusters");
     }
     if (rt === "vector_search") {
       cfg.endpoint_type = v(".vs-type");
@@ -1036,6 +1388,7 @@ function collectPayload() {
     business_domain: val("f-business_domain"),
     data_classification: val("f-data_classification"),
     environment: val("f-environment"),
+    medallion_layer: val("f-medallion_layer") || null,
     region: val("f-region") || null,
     target_workspace: placementMode() === "existing" ? (val("f-target_workspace") || null) : null,
     data_retention: val("f-data_retention") || null,
@@ -1082,6 +1435,7 @@ async function submitIntake() {
     showStep(Math.min(...missing.map(m => m.step)));
     return;
   }
+  if (AMEND) { await submitAmendment(errBox); return; }
   try {
     const r = await api("/api/requests", { method: "POST", body: JSON.stringify(collectPayload()) });
     const w = r.waf || {};
@@ -1093,15 +1447,219 @@ async function submitIntake() {
     switchView("approvals");
   } catch (e) {
     const errs = (e.body && e.body.details && e.body.details.errors) || [e.body && e.body.error || "request failed"];
-    errBox.innerHTML = `<div class="errors"><b>Request blocked (${e.status})</b><ul>${errs.map(x => `<li>${x}</li>`).join("")}</ul></div>`;
+    errBox.innerHTML = `<div class="errors"><b>Request blocked (${esc(e.status)})</b><ul>${errs.map(x => `<li>${esc(x)}</li>`).join("")}</ul></div>`;
     showStep(0);
   }
+}
+
+// ------------------------------------------------------------ amend (change request)
+// AMEND is set when the intake form is opened to edit an existing request. Submitting then
+// posts to /amend (approver + e-signature) instead of creating a brand-new project.
+let AMEND = null;
+
+function openAmend(request) {
+  AMEND = { request_id: String(request.id), project_id: request.project_id,
+            label: request.use_case_name || request.project_name || request.project_id };
+  document.getElementById("modal").classList.add("hidden");
+  switchView("intake");
+  // renderIntake() runs synchronously via switchView; prefill immediately after.
+  prefillIntake(request);
+  injectAmendBanner();
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+function cancelAmend() {
+  AMEND = null;
+  renderIntake();
+  toast("Amendment cancelled");
+}
+
+function injectAmendBanner() {
+  const v = document.getElementById("view-intake");
+  if (!v || document.getElementById("amend-banner")) return;
+  const b = el("div", { class: "card", id: "amend-banner" });
+  b.style.borderColor = "var(--lava)";
+  b.innerHTML = `
+    <div class="flex"><h3 style="margin:0">✎ Amending an existing project</h3>
+      <button class="btn ghost small right" id="amend-cancel">Cancel amendment</button></div>
+    <p class="muted" style="font-size:12px;margin:6px 0">
+      Change request against <b>${esc(AMEND.label)}</b> <span class="mono">${esc(AMEND.project_id)}</span>.
+      On submit, the amended metadata re-tags the project's existing assets and any net-new
+      resource is provisioned. Requires an <b>approver</b> persona + e-signature.</p>
+    <label class="field">E-signature (approver full name)</label>
+    <input id="amend-esig" placeholder="Type your full name to sign this change" />`;
+  v.insertBefore(b, v.children[2] || null);   // under the title/sub, above the co-pilot
+  b.querySelector("#amend-cancel").onclick = cancelAmend;
+}
+
+async function submitAmendment(errBox) {
+  const esig = (document.getElementById("amend-esig") || {}).value || "";
+  if (!esig.trim()) { toast("An e-signature is required to submit an amendment", false);
+    document.getElementById("amend-esig")?.focus(); return; }
+  const payload = Object.assign(collectPayload(), { esignature: esig.trim() });
+  try {
+    const r = await api(`/api/requests/${AMEND.request_id}/amend`,
+      { method: "POST", body: JSON.stringify(payload) });
+    const parts = [];
+    const nNew = (r.provisioned_new || []).length;
+    if (nNew) parts.push(`+${nNew} new resource(s) queued`);
+    if ((r.retagged || []).length) parts.push(`re-tagged ${r.retagged.length} asset(s)`);
+    toast(`Amended ${r.project_id} — ${parts.join(" · ") || "recorded"} · track in Requests`);
+    AMEND = null;
+    switchView("requests");
+  } catch (e) {
+    const errs = (e.body && e.body.details && e.body.details.errors) || [(e.body && e.body.error) || "amendment failed"];
+    errBox.innerHTML = `<div class="errors"><b>Amendment blocked (${esc(e.status)})</b><ul>${errs.map(x => `<li>${esc(x)}</li>`).join("")}</ul></div>`;
+    showStep(0);
+  }
+}
+
+// Prefill every intake field from a request record (used by amend). Extends applyDraft's
+// subset to the full governed field-set + resource selection.
+function prefillIntake(rq) {
+  const set = (id, val) => { const e = document.getElementById(id); if (e != null && val != null && val !== "") e.value = val; };
+  const check = (id, val) => { const e = document.getElementById(id); if (e) e.checked = !!val; };
+  set("f-project_name", rq.project_name); set("f-use_case_name", rq.use_case_name);
+  set("f-description", rq.description); set("f-justification", rq.justification);
+  set("f-business_domain", rq.business_domain);
+  refreshTaxonomy("lob"); set("f-business_function", rq.business_function);
+  refreshTaxonomy("function"); set("f-business_sub_function", rq.business_sub_function);
+  set("f-business_owner", rq.business_owner); set("f-owner_group", rq.owner_group);
+  set("f-technical_lead", rq.technical_lead); set("f-backup_owner", rq.backup_owner);
+  set("f-support_contact", rq.support_contact); set("f-department", rq.department);
+  set("f-cost_center", rq.cost_center); set("f-cost_type", rq.cost_type);
+  set("f-budget_monthly_cap", rq.budget_monthly_cap); set("f-wbs_code", rq.wbs_code);
+  set("f-data_classification", rq.data_classification); set("f-environment", rq.environment);
+  set("f-medallion_layer", rq.medallion_layer); set("f-region", rq.region);
+  set("f-data_retention", rq.data_retention); set("f-lifecycle_stage", rq.lifecycle_stage);
+  set("f-sla_tier", rq.sla_tier); set("f-rto_hours", rq.rto_hours); set("f-rpo_hours", rq.rpo_hours);
+  set("f-go_live_date", rq.go_live_date); set("f-sunset_date", rq.sunset_date);
+  set("f-dpia_ref", rq.dpia_ref); set("f-security_review_status", rq.security_review_status);
+  set("f-intended_use", rq.intended_use); set("f-out_of_scope_uses", rq.out_of_scope_uses);
+  set("f-model_card_ref", rq.model_card_ref); set("f-ai_risk_tier", rq.ai_risk_tier);
+  set("f-change_ref", rq.change_ref); set("f-servicenow_ref", rq.servicenow_ref);
+  set("f-jira_epic", rq.jira_epic); set("f-confluence_url", rq.confluence_url);
+  const setList = (id, arr) => set(id, Array.isArray(arr) ? arr.join(", ") : arr);
+  setList("f-depends_on", rq.depends_on); setList("f-source_systems", rq.source_systems);
+  setList("f-consumed_by", rq.consumed_by);
+  check("f-gxp_relevant", rq.gxp_relevant); check("f-contains_phi", rq.contains_phi);
+  check("f-validated_system", rq.validated_system); check("f-human_oversight", rq.human_oversight);
+  document.querySelectorAll("#f-compliance input").forEach(cb => {
+    cb.checked = (rq.compliance_scope || []).includes(cb.value);
+  });
+  selectResources(new Set((rq.resources || []).map(r => r.type)));
+  refreshHints(); updateCompletion();
+}
+
+// ================================================================== REQUESTS
+// Request-centric lifecycle view: the home a request has AFTER submit. Serves the
+// requester (track my submissions + amend), the approver (full ledger of decisions), and
+// compliance/audit (signatures + audit trail on every request).
+const STATUS_PILL = { ACTIVE: "real", APPROVED: "real", PROVISIONING: "", PARTIAL: "degraded",
+                      FAILED: "tier2", REJECTED: "tier2", DECOMMISSIONED: "" };
+const statusPillClass = (s) => STATUS_PILL[s] || "";
+
+async function renderRequests() {
+  const v = document.getElementById("view-requests");
+  const mineDefault = persona === "requester";
+  v.innerHTML = `<h1>Requests &amp; change history</h1>
+    <p class="sub">Every request submitted — track status, open full detail (metadata, resources, approvals, signatures, audit), and amend an existing project as a new change request.</p>`;
+  const fc = el("div", { class: "card" });
+  fc.innerHTML = `
+    <div class="row" style="align-items:center">
+      <label class="check"><input type="checkbox" id="rq-mine" ${mineDefault ? "checked" : ""}/> Only mine (${esc(PERSONAS[persona].email)})</label>
+      <div style="flex:1"></div>
+      <label class="field" style="margin:0;margin-right:8px">Status:</label>
+      <select id="rq-status" style="max-width:200px">
+        <option value="">All statuses</option>
+        ${["PENDING_APPROVAL", "APPROVED", "PROVISIONING", "ACTIVE", "PARTIAL", "FAILED", "REJECTED", "DECOMMISSIONED"]
+          .map(s => `<option value="${s}">${s}</option>`).join("")}
+      </select>
+    </div>
+    <div class="row" style="align-items:center; margin-top:8px">
+      <input id="rq-search" placeholder="Filter by project, use case, request id, requester, or resource…" style="flex:1" />
+      <label class="field" style="margin:0 8px">Kind:</label>
+      <select id="rq-kind" style="max-width:170px">
+        <option value="">All kinds</option>
+        <option value="create">create</option>
+        <option value="amendment">amendment</option>
+        <option value="add_resources">add_resources</option>
+      </select>
+    </div>`;
+  v.appendChild(fc);
+  const tableCard = el("div", { class: "card" });
+  tableCard.innerHTML = `<p class="muted">Loading…</p>`;
+  v.appendChild(tableCard);
+
+  let allRows = [];
+  const render = () => {
+    const q = (document.getElementById("rq-search").value || "").trim().toLowerCase();
+    const kindF = document.getElementById("rq-kind").value;
+    let rows = allRows.slice();
+    if (kindF) rows = rows.filter(r => (((r.metadata || {}).change_kind || r.change_kind || "create") === kindF));
+    if (q) rows = rows.filter(r => {
+      const hay = [r.use_case_name, r.project_name, r.project_id, r.requester, r.risk_tier, r.status,
+                   ...(r.resources || []).map(x => x.type)].filter(Boolean).join(" ").toLowerCase();
+      return hay.includes(q);
+    });
+    if (!rows.length) { tableCard.innerHTML = `<p class="muted">No requests match these filters.</p>`; return; }
+    rows.sort((a, b) => ((toDate(b.created_at) || 0) - (toDate(a.created_at) || 0)));
+    const t = el("table");
+    t.innerHTML = `<thead><tr><th>Use case / project</th><th>Tier</th><th>Status</th><th>Approvals</th><th>Resources</th><th>Requester</th><th>Created</th></tr></thead>`;
+    const tb = el("tbody");
+    rows.forEach(r => {
+      const tr = el("tr", { class: "click" });
+      const d = toDate(r.created_at);
+      const created = d ? d.toLocaleDateString() : "—";
+      const kind = (r.metadata || {}).change_kind || r.change_kind;
+      const isChange = kind && kind !== "create";
+      // Approvals summary from the enriched list. "Pending" is shown ONLY while the request
+      // is actually in the approval queue; approved/active states show ✓ / auto / e-signed
+      // (change requests are e-signed at creation, so they carry no queue approvals).
+      const req = r.required_approvals || 0, got = r.approvals_count || 0;
+      let appCell = "—";
+      if (r.status === "REJECTED" || r.rejected) appCell = `<span class="kv tier2">rejected</span>`;
+      else if (r.status === "PENDING_APPROVAL") appCell = `<span class="kv">⏳ ${got}/${req || 1}</span>`;
+      else if (r.auto_approved && !got) appCell = `<span class="kv ok" title="pre-authorized standard change">auto</span>`;
+      else if (isChange && !got) appCell = `<span class="kv ok" title="approver e-signed the change">✓ e-signed</span>`;
+      else appCell = `<span class="kv ok">✓ ${got || req}/${req || got}</span>`;
+      tr.innerHTML = `
+        <td><b>${esc(r.use_case_name || r.project_name || "—")}</b>${isChange ? ` <span class="kv">${esc(kind)}</span>` : ""}
+          <div class="mono muted" style="font-size:11px">${esc(r.project_id)}</div></td>
+        <td>${tierPill(r.risk_tier)}</td>
+        <td><span class="pill ${statusPillClass(r.status)}">${esc(r.status)}</span></td>
+        <td style="font-size:12px">${appCell}</td>
+        <td>${(r.resources || []).map(x => `<span class="kv">${esc(x.type)}</span>`).join("") || "—"}</td>
+        <td class="muted" style="font-size:12px">${esc(r.requester)}</td>
+        <td class="muted" style="font-size:12px">${esc(created)}</td>`;
+      tr.onclick = () => showRequestDetail(r.id);
+      tb.appendChild(tr);
+    });
+    t.appendChild(tb);
+    tableCard.innerHTML = ""; tableCard.appendChild(t);
+  };
+  const load = async () => {
+    const qs = new URLSearchParams();
+    if (document.getElementById("rq-mine").checked) qs.set("mine", "true");
+    const status = document.getElementById("rq-status").value;
+    if (status) qs.set("status", status);
+    try { allRows = await api("/api/requests" + (qs.toString() ? "?" + qs : "")); }
+    catch (e) { tableCard.innerHTML = `<p class="muted">Could not load requests (${esc(e.status)}).</p>`; return; }
+    render();
+  };
+  document.getElementById("rq-mine").onchange = load;
+  document.getElementById("rq-status").onchange = load;
+  document.getElementById("rq-search").oninput = render;
+  document.getElementById("rq-kind").onchange = render;
+  load();
 }
 
 // ================================================================== APPROVALS
 async function renderApprovals() {
   const v = document.getElementById("view-approvals");
-  v.innerHTML = `<h1>Approval queue</h1><p class="sub">Risk-tiered gates. Tier-2 (restricted/GxP/PHI/prod) needs two distinct approvers + compliance.</p>`;
+  v.innerHTML = `<h1>Approval queue</h1><p class="sub">Risk-tiered gates. Tier-2 (restricted/GxP/PHI/prod) needs two distinct approvers + compliance.</p>
+    <div id="provision-status"></div>
+    <p class="muted">Loading queue…</p>`;
   let queue;
   try { queue = await api("/api/approvals/queue"); }
   catch (e) {
@@ -1117,24 +1675,54 @@ async function renderApprovals() {
       highlightCard = c;
     }
     const approves = (r.approvals || []).filter(a => a.decision === "approve").length;
+    // The server decides gate entitlement; the card just reflects it, so an approver sees
+    // "compliance must sign this" instead of discovering it as a rejected POST.
+    const signable = r.signable_gates || [];
+    // Per-gate status: who has signed each required gate, and which are still pending —
+    // so a Tier-2 request shows "✓ platform — Alex Rivera · ⏳ security-compliance — pending".
+    const byGate = {};
+    (r.approvals || []).filter(a => a.decision === "approve").forEach(a => { byGate[a.gate] = a.approver; });
+    const gates = (r.required_gates || []).length
+      ? `<div class="gate-status" style="font-size:12px; margin:6px 0">
+          <span class="muted">Approvals:</span> ${(r.required_gates || []).map(g => byGate[g]
+            ? `<span class="kv ok" title="signed">✓ ${esc(g)} — ${esc(byGate[g])}</span>`
+            : `<span class="kv" title="pending">⏳ ${esc(g)} — pending</span>`).join(" ")}</div>`
+      : "";
     c.innerHTML = `
       <div class="flex">
-        <h3>${r.use_case_name || r.project_name} <span class="mono muted">${r.project_id}</span></h3>
-        <div class="right">${tierPill(r.risk_tier)} <span class="pill">${approves}/${r.required_approvals} approvals</span></div>
+        <h3>${esc(r.use_case_name || r.project_name)} <span class="mono muted">${esc(r.project_id)}</span></h3>
+        <div class="right">${tierPill(r.risk_tier)} <span class="pill">${esc(approves)}/${esc(r.required_approvals)} approvals</span></div>
       </div>
-      <div class="muted" style="font-size:12px">${r.requester} · ${[r.business_domain, r.business_function, r.business_sub_function].filter(Boolean).join(" › ")} · ${r.data_classification} · ${r.environment} · CC ${r.cost_center}</div>
-      ${r.business_owner ? `<div class="muted" style="font-size:12px">Business owner: ${r.business_owner}${r.project_name && r.use_case_name ? ` · asset: ${r.project_name}` : ""}</div>` : ""}
-      <p style="font-size:13px">${r.justification || ""}</p>
-      <div class="tagset">${(r.resources || []).map(x => `<span class="kv">${x.type}</span>`).join("")}</div>
+      <div class="muted" style="font-size:12px">${esc(r.requester)} · ${esc([r.business_domain, r.business_function, r.business_sub_function].filter(Boolean).join(" › "))} · ${esc(r.data_classification)} · ${esc(r.environment)} · CC ${esc(r.cost_center)}</div>
+      ${r.business_owner ? `<div class="muted" style="font-size:12px">Business owner: ${esc(r.business_owner)}${r.project_name && r.use_case_name ? ` · asset: ${esc(r.project_name)}` : ""}</div>` : ""}
+      ${gates}
+      <p style="font-size:13px">${esc(r.justification)}</p>
+      <div class="tagset">${(r.resources || []).map(x => `<span class="kv">${esc(x.type)}</span>`).join("")}</div>
       ${wafPanel((r.metadata || {}).waf)}
-      <div class="row" style="margin-top:10px">
-        <input class="esig" placeholder="Type your full name (e-signature)" />
-        <button class="btn small approve">Approve &amp; sign</button>
-        <button class="btn ghost small reject">Reject</button>
-      </div>`;
-    const sig = () => c.querySelector(".esig").value.trim();
-    c.querySelector(".approve").onclick = () => decide(r.id, "approve", sig());
-    c.querySelector(".reject").onclick = () => decide(r.id, "reject", sig());
+      <div style="margin:8px 0"><button class="btn ghost small" id="detail-${esc(r.id)}">View details</button></div>
+      ${signable.length
+        ? `<div style="margin-top:10px">
+             <textarea class="acomment" rows="2" placeholder="Decision comment / rationale — stored on the e-signature (required to reject)"></textarea>
+             <div class="row" style="margin-top:8px">
+               <input class="esig" placeholder="Type your full name (e-signature)" />
+               ${signable.length > 1
+                 ? `<select class="gate">${signable.map(g => `<option value="${esc(g)}">${esc(g)}</option>`).join("")}</select>`
+                 : ""}
+               <button class="btn small approve">Approve &amp; sign${signable.length === 1 ? ` (${esc(signable[0])})` : ""}</button>
+               <button class="btn ghost small reject">Reject</button>
+             </div>
+           </div>`
+        : `<div class="muted" style="margin-top:10px;font-size:12px">
+             <span class="pill tier2">cannot sign</span> ${esc(r.blocked_reason || "no outstanding gate you are entitled to sign")}
+           </div>`}`;
+    if (signable.length) {
+      const sig = () => c.querySelector(".esig").value.trim();
+      const gate = () => (c.querySelector(".gate") || {}).value || signable[0];
+      const comment = () => c.querySelector(".acomment").value.trim();
+      c.querySelector(".approve").onclick = () => decide(r.id, "approve", sig(), gate(), comment(), c);
+      c.querySelector(".reject").onclick = () => decide(r.id, "reject", sig(), gate(), comment(), c);
+    }
+    c.querySelector(`#detail-${esc(r.id)}`).onclick = () => showRequestDetail(r.id);
     v.appendChild(c);
   });
   if (highlightCard) {
@@ -1143,36 +1731,184 @@ async function renderApprovals() {
   }
 }
 
-async function decide(rid, decision, esignature) {
+// Lock a card (grey out + disable every control) while its decision is in flight / the
+// request provisions, so the approver can't double-act; `label` shows what's happening.
+function setCardBusy(card, label) {
+  if (!card) return;
+  card.querySelectorAll("button, input, select, textarea").forEach(el => (el.disabled = true));
+  card.style.opacity = "0.6"; card.style.pointerEvents = "none";
+  let b = card.querySelector(".card-busy");
+  if (!b) { b = el("div", { class: "card-busy", style: "margin-top:10px" }); card.appendChild(b); }
+  b.innerHTML = `<span class="pill">⏳ ${esc(label)}</span>`;
+}
+function clearCardBusy(card) {
+  if (!card) return;
+  card.querySelectorAll("button, input, select, textarea").forEach(el => (el.disabled = false));
+  card.style.opacity = ""; card.style.pointerEvents = "";
+  const b = card.querySelector(".card-busy"); if (b) b.remove();
+}
+
+async function decide(rid, decision, esignature, gate, comment, card) {
   if (!esignature) { toast("An e-signature is required", false); return; }
+  if (decision === "reject" && !comment) { toast("A comment is required to reject", false); return; }
+  // The comment is the stored rationale (bound into the signed manifest); fall back to the
+  // decision word only when an approval is signed without a note.
+  const reason = comment || (decision === "approve" ? "approved" : "rejected");
+  setCardBusy(card, decision === "approve" ? "Submitting approval…" : "Submitting rejection…");
   try {
     const r = await api(`/api/approvals/${rid}/decision`, {
-      method: "POST", body: JSON.stringify({ decision, reason: decision, esignature }),
+      method: "POST",
+      body: JSON.stringify({ decision, reason, esignature, gate: gate || null,
+                             meaning: decision === "approve" ? "approved" : "rejected" }),
     });
-    toast(`${decision}: ${r.status}` + (r.provisioning ? " — provisioning triggered" : ""));
+    if (r.outstanding_gates && r.outstanding_gates.length) {
+      toast(`Signed ${r.signed_gate} — ${r.outstanding_gates.length} gate${r.outstanding_gates.length !== 1 ? 's' : ''} remaining`);
+      setTimeout(renderApprovals, 500);
+      return;
+    }
+    toast(`${decision}: ${r.status}` + (r.provisioning ? " — provisioning started" : ""));
+    if (r.provisioning) {
+      // Keep the card locked and show live progress; watchProvisioning polls to a terminal
+      // state, refreshes the queue, and the final status lands on the Requests page.
+      setCardBusy(card, `Provisioning ${String(rid).slice(0, 8)}… — final status shows in Requests`);
+      watchProvisioning(rid);
+      return;
+    }
     setTimeout(renderApprovals, 600);
-  } catch (e) { toast((e.body && e.body.error) || "decision failed", false); }
+  } catch (e) {
+    clearCardBusy(card);   // let the approver retry
+    toast((e.body && e.body.error) || "decision failed", false);
+  }
+}
+
+// Approving used to end the story on the client: the toast said "provisioning triggered"
+// and nothing ever reported whether it worked. Poll to a terminal state, and when it
+// fails, say why and offer the re-drive instead of leaving a dead end.
+async function watchProvisioning(rid) {
+  const TERMINAL = ["ACTIVE", "PARTIAL", "FAILED", "REJECTED"];
+  // Re-query every time: the queue re-renders underneath this and would otherwise leave
+  // us writing into a detached node.
+  const show = (html) => {
+    const box = document.getElementById("provision-status");
+    if (box) box.innerHTML = html;
+  };
+  for (let i = 0; i < 40; i++) {
+    let r;
+    try { r = await api(`/api/requests/${rid}`); }
+    catch (e) { show(`<div class="errors">Lost track of ${esc(rid)}: ${esc((e.body && e.body.error) || e.status)}</div>`); return; }
+    const st = r.status;
+    if (!TERMINAL.includes(st)) {
+      show(`<div class="card"><span class="pill">${esc(st)}</span> provisioning <span class="mono">${esc(rid)}</span>…</div>`);
+      await new Promise(res => setTimeout(res, 1500));
+      continue;
+    }
+    const assets = r.assets || [];
+    const failed = (r.metadata || {}).failed || [];
+    const rows = assets.map(a => `<span class="kv">${esc(a.type)} ${modePill(a.mode)}${
+      a.degraded ? ` <span class="pill degraded">modelled: ${esc(reasonLabel(a.mode_reason))}</span>` : ""}</span>`).join(" ");
+    const problems = failed.map(f => `<div class="audit-ev"><span class="pill tier2">${esc(f.type || "resource")}</span> ${esc(f.error || "failed")}</div>`).join("");
+    await renderApprovals();   // request has left the queue; refresh it before reporting
+    show(`<div class="card"><div class="flex"><h3>${esc(st)}</h3>
+        <div class="right">${st === "PARTIAL" || st === "FAILED"
+          ? `<button class="btn small" id="pv-retry">Retry failed resources</button>` : ""}</div></div>
+      <div class="tagset">${rows}</div>${problems}</div>`);
+    const btn = document.getElementById("pv-retry");
+    if (btn) btn.onclick = async () => {
+      try { await api(`/api/requests/${rid}/retry`, { method: "POST" }); toast("Retrying…"); watchProvisioning(rid); }
+      catch (e) { toast((e.body && e.body.error) || "retry failed", false); }
+    };
+    // Final verdict — surfaces "succeeded/failed"; the Requests page shows the same status.
+    toast(`${esc(r.project_id || rid)} — ${st}${failed.length ? ` (${failed.length} failed)` : ""}`,
+          st === "ACTIVE");
+    return;
+  }
+  show(`<div class="errors">Still provisioning <span class="mono">${esc(rid)}</span> after 60s — check the registry.</div>`);
 }
 
 // =================================================================== REGISTRY
+const REASON_LABELS = {
+  kill_switch_off: "real provisioning disabled",
+  no_permission: "no permission",
+  unsupported_here: "unsupported in this workspace",
+  missing_prerequisite: "missing prerequisite",
+  sdk_unavailable: "SDK does not support it",
+  sdk_error: "create call failed",
+  provider_unavailable: "no real provider",
+};
+const reasonLabel = (r) => REASON_LABELS[r] || r || "unknown";
+
 async function renderRegistry() {
   const v = document.getElementById("view-registry");
   v.innerHTML = `<h1>Asset &amp; ownership registry</h1><p class="sub">The CMDB of vended resources. Ownership is by reference — reassign and tags follow.</p>`;
   const assets = await api("/api/assets");
+  const currentPersonaEmail = PERSONAS[persona].email;
+  const filterCard = el("div", { class: "card" });
+  filterCard.innerHTML = `
+    <div class="row" style="align-items:center; margin-bottom:10px">
+      <label class="check"><input type="checkbox" id="filter-mine"/> Show only my assets</label>
+      <div style="flex:1"></div>
+      <label class="field" style="margin:0; margin-right:10px">Status:</label>
+      <select id="filter-status" style="max-width:180px">
+        <option value="">All statuses</option>
+        <option value="ACTIVE">ACTIVE</option>
+        <option value="PROVISIONING">PROVISIONING</option>
+        <option value="PARTIAL">PARTIAL</option>
+        <option value="FAILED">FAILED</option>
+        <option value="DECOMMISSIONED">DECOMMISSIONED</option>
+      </select>
+    </div>`;
+  v.appendChild(filterCard);
+
   const t = el("table");
-  t.innerHTML = `<thead><tr><th>Type</th><th>Mode</th><th>Handle</th><th>Owner</th><th>Project</th><th>Request</th><th>Tags</th></tr></thead>`;
+  t.innerHTML = `<thead><tr><th>Type</th><th>Mode</th><th>Handle</th><th>Owner</th><th>Project</th><th>Request</th><th>Status</th><th>Tags</th></tr></thead>`;
   const tb = el("tbody");
-  assets.forEach(a => {
-    const tr = el("tr");
-    tr.innerHTML = `<td><b>${a.type}</b></td><td>${modePill(a.mode)}</td>
-      <td class="mono">${a.external_id || ""}</td><td>${a.owner_id || ""}</td>
-      <td class="mono">${a.project_id || ""}</td><td class="mono">${a.request_id || ""}</td>
-      <td>${tagsHtml(a.applied_tags)}</td>`;
-    tb.appendChild(tr);
-  });
+
+  const applyFilters = () => {
+    const mineOnly = document.getElementById("filter-mine").checked;
+    const statusFilter = document.getElementById("filter-status").value;
+    const filtered = assets.filter(a => {
+      if (mineOnly && a.owner_id !== currentPersonaEmail) return false;
+      if (statusFilter && a.status !== statusFilter) return false;
+      return true;
+    });
+
+    tb.innerHTML = "";
+    if (!filtered.length) {
+      tb.innerHTML = `<tr><td colspan="8" class="muted">No assets match filters.</td></tr>`;
+      return;
+    }
+    filtered.forEach(a => {
+      const tr = el("tr");
+      const why = a.degraded
+        ? ` <span class="pill degraded" title="${esc(a.mode_reason)}">modelled: ${esc(reasonLabel(a.mode_reason))}</span>`
+        : "";
+      // The full governed tag set is ~18 chips — inline it would blow the row height apart
+      // (as reported). Collapse to a "N tags" disclosure that expands in place on click.
+      const nTags = Object.keys(a.applied_tags || {}).length;
+      const tagsCell = nTags
+        ? `<details class="tags-cell"><summary>${nTags} tags</summary>${tagsHtml(a.applied_tags)}</details>`
+        : "—";
+      tr.innerHTML = `<td><b>${esc(a.type)}</b></td><td>${modePill(a.mode)}${why}</td>
+        <td class="mono">${esc(a.external_id)}</td><td>${esc(a.owner_id)}</td>
+        <td class="mono">${esc(a.project_id)}</td><td class="mono">${esc(a.request_id)}</td>
+        <td><span class="pill ${a.status === 'ACTIVE' || a.status === 'real' ? 'real' : a.status === 'FAILED' || a.status === 'degraded' ? 'tier2' : ''}">${esc(a.status || 'ACTIVE')}</span></td>
+        <td>${tagsCell}</td>`;
+      tb.appendChild(tr);
+    });
+  };
+
+  if (!assets.length) {
+    tb.innerHTML = `<tr><td colspan="8" class="muted">No assets vended yet.</td></tr>`;
+  } else {
+    applyFilters();
+  }
+
   t.appendChild(tb);
   const card = el("div", { class: "card" }); card.appendChild(t);
   v.appendChild(card);
+
+  document.getElementById("filter-mine").onchange = applyFilters;
+  document.getElementById("filter-status").onchange = applyFilters;
 
   // reassignment
   v.appendChild(el("div", { class: "section-title" }, "<h2>Ownership reassignment</h2>"));
@@ -1255,18 +1991,94 @@ async function renderRegistry() {
         resources: types.map(t => ({ type: t, config: {} })),
         esignature: document.getElementById("lc-add-sig").value.trim(),
       }) });
-      toast(`Added ${r.created.length} resource(s) to ${rid}` + (r.failed.length ? `, ${r.failed.length} failed` : ""));
+      const cr = String(r.change_request_id || "").slice(0, 8);
+      toast(`Queued ${(r.resources || types).length} resource(s) as change request ${cr} — track in Requests`);
       renderRegistry();
     } catch (e) { toast((e.body && e.body.error) || "add resources failed", false); }
   };
   v.appendChild(lc);
+
+  renderAccess(v);
+}
+
+// Access requests: the highest-volume ticket on a real platform team ("give my group read
+// on this schema"). Vending a resource and then sending people back to ServiceNow for a
+// grant would undercut the whole premise.
+async function renderAccess(v) {
+  let g;
+  try { g = await api("/api/access/grantable"); } catch (e) { return; }
+  v.appendChild(el("div", { class: "section-title" }, "<h2>Access requests</h2>"));
+  const c = el("div", { class: "card" });
+  // Levels differ per securable (a catalog has no write); offer the union and let the
+  // server refuse the combination that does not apply to the chosen asset.
+  const byLevel = {};
+  Object.entries(g.grantable || {}).forEach(([securable, levels]) =>
+    Object.entries(levels).forEach(([lvl, meta]) => {
+      byLevel[lvl] = byLevel[lvl] || { securables: [], risk: meta.risk };
+      byLevel[lvl].securables.push(securable);
+    }));
+  const levels = Object.entries(byLevel);
+  c.innerHTML = `
+    <p class="muted" style="font-size:12px">Grant a group on an already-vended asset. Read is self-service;
+      write and manage on restricted or GxP data need an approver and an e-signature. Every grant is audited
+      and shows up on the asset.</p>
+    <div class="row">
+      <div><label class="field">Asset id</label><input id="ac-asset" placeholder="asset id from the table above" /></div>
+      <div><label class="field">Principal (group)</label><input id="ac-principal" placeholder="dbx-clinical-analysts" /></div>
+    </div>
+    <div class="row">
+      <div><label class="field">Level</label><select id="ac-level">${levels.map(([k, meta]) =>
+        `<option value="${esc(k)}">${esc(k)} — ${esc(meta.securables.join("/"))}${meta.risk === "high" ? " (needs approval)" : ""}</option>`).join("")}</select></div>
+      <div><label class="field">Duration (days, blank = permanent)</label><input id="ac-days" type="number" min="1" max="365" /></div>
+    </div>
+    <label class="field">Justification</label><input id="ac-why" placeholder="why this group needs it" />
+    <label class="field">E-signature (only if approval is required)</label><input id="ac-sig" placeholder="Type your full name" />
+    <div style="margin-top:10px"><button class="btn" id="ac-go">Request access</button></div>
+    <div id="ac-out" style="margin-top:10px"></div>`;
+  v.appendChild(c);
+  c.querySelector("#ac-go").onclick = async () => {
+    const days = parseInt(document.getElementById("ac-days").value, 10);
+    try {
+      const r = await api("/api/access/request", { method: "POST", body: JSON.stringify({
+        asset_id: document.getElementById("ac-asset").value.trim(),
+        principal: document.getElementById("ac-principal").value.trim(),
+        level: document.getElementById("ac-level").value,
+        justification: document.getElementById("ac-why").value.trim(),
+        esignature: document.getElementById("ac-sig").value.trim(),
+        duration_days: Number.isFinite(days) ? days : null,
+      }) });
+      const applied = r.applied || {};
+      c.querySelector("#ac-out").innerHTML =
+        `<div class="audit-ev">Granted <span class="mono">${esc(r.privileges.join(", "))}</span> to
+         <b>${esc(r.principal)}</b> on <span class="mono">${esc(r.asset_id)}</span>
+         ${modePill(applied.mode)}${applied.mode === "simulated"
+            ? ` <span class="pill degraded">modelled: ${esc(reasonLabel(applied.mode_reason))}</span>` : ""}
+         · approval: ${esc(r.approval)}</div>`;
+      toast(`Access granted to ${r.principal}`);
+    } catch (e) {
+      c.querySelector("#ac-out").innerHTML = `<div class="errors">${esc((e.body && e.body.error) || "access request failed")}</div>`;
+    }
+  };
 }
 
 // ================================================================ GOVERNANCE
 async function renderGovernance() {
   const v = document.getElementById("view-governance");
   v.innerHTML = `<h1>Day-2 governance</h1><p class="sub">Sunset autopilot, tag-drift &amp; orphan sweep, and owner recertification — keeping vended resources healthy after provisioning.</p>`;
-  const [sw, rc] = await Promise.all([api("/api/governance/sweep"), api("/api/governance/recertification")]);
+
+  let sw, rc;
+  try { sw = await api("/api/governance/sweep"); }
+  catch (e) {
+    v.appendChild(el("div", { class: "card" },
+      `<b>Governance sweep unavailable</b> (${e.status}). Check back later.`));
+    sw = { clean: 0, past_sunset: [], tag_drift: [] };
+  }
+  try { rc = await api("/api/governance/recertification"); }
+  catch (e) {
+    v.appendChild(el("div", { class: "card" },
+      `<b>Recertification data unavailable</b> (${e.status}). Check back later.`));
+    rc = { due_count: 0, due: [], recert_age_days: 0 };
+  }
 
   const kpis = el("div", { class: "grid cols-4" });
   kpis.innerHTML = `
@@ -1287,10 +2099,11 @@ async function renderGovernance() {
     sw.past_sunset.forEach(a => {
       const tr = el("tr");
       const restricted = a.classification === "restricted";
-      tr.innerHTML = `<td class="mono">${a.asset_id}</td><td>${a.type}</td><td>${a.sunset_date}</td>
-        <td>${a.classification || ""}</td>
+      tr.innerHTML = `<td class="mono">${esc(a.asset_id)}</td><td>${esc(a.type)}</td><td>${esc(a.sunset_date)}</td>
+        <td>${esc(a.classification || "")}</td>
         <td>${restricted ? '<span class="pill tier2">controlled change</span>'
-                         : `<button class="btn small reclaim" data-id="${a.asset_id}">Reclaim</button>`}</td>`;
+                         : `<button class="btn small reclaim" data-id="${esc(a.asset_id)}">Reclaim</button>
+                            <button class="btn ghost small extend" data-id="${esc(a.asset_id)}">Extend</button>`}</td>`;
       tb.appendChild(tr);
     });
     t.appendChild(tb); sc.appendChild(t);
@@ -1301,14 +2114,28 @@ async function renderGovernance() {
       toast(`Reclaimed ${r.asset_id} -> ${r.status}`); renderGovernance(); }
     catch (e) { toast((e.body && e.body.error) || "reclaim failed", false); }
   });
+  // Extension is the honest alternative to reclaim: still needed, so say so on the record
+  // with a new date and a justification rather than letting the sweep nag forever.
+  sc.querySelectorAll(".extend").forEach(b => b.onclick = async () => {
+    const date = prompt("New sunset date (YYYY-MM-DD):");
+    if (!date) return;
+    const why = prompt("Why is this still needed?") || "";
+    try {
+      const r = await api(`/api/governance/extend/${b.dataset.id}`, {
+        method: "POST", body: JSON.stringify({ sunset_date: date, justification: why }) });
+      toast(`Extended ${r.asset_id} to ${r.sunset_date}`); renderGovernance();
+    } catch (e) { toast((e.body && e.body.error) || "extend failed", false); }
+  });
 
   // Tag drift
   v.appendChild(el("div", { class: "section-title" }, "<h2>Tag drift</h2>"));
   const dc = el("div", { class: "card" });
   dc.innerHTML = sw.tag_drift.length ? sw.tag_drift.map(d =>
-    `<div class="audit-ev"><span class="mono">${d.asset_id}</span> · coverage ${Math.round(d.coverage*100)}% · missing: ${d.missing.join(", ")}</div>`).join("")
+    `<div class="audit-ev"><span class="mono">${esc(d.asset_id)}</span> · coverage ${Math.round(d.coverage*100)}% · missing: ${esc(d.missing.join(", "))}</div>`).join("")
     : `<p class="muted">All active assets at 100% required-tag coverage.</p>`;
   v.appendChild(dc);
+
+  renderReconcile(v);
 
   // Recertification
   v.appendChild(el("div", { class: "section-title" }, `<h2>Recertification</h2><span class="pill">> ${rc.recert_age_days} days</span>`));
@@ -1320,8 +2147,8 @@ async function renderGovernance() {
     const tb = el("tbody");
     rc.due.forEach(a => {
       const tr = el("tr");
-      tr.innerHTML = `<td class="mono">${a.asset_id}</td><td>${a.type}</td><td>${a.owner_id||""}</td>
-        <td>${a.age_days}d</td><td><button class="btn ghost small recert" data-id="${a.asset_id}">Attest still needed</button></td>`;
+      tr.innerHTML = `<td class="mono">${esc(a.asset_id)}</td><td>${esc(a.type)}</td><td>${esc(a.owner_id||"")}</td>
+        <td>${esc(a.age_days)}d</td><td><button class="btn ghost small recert" data-id="${esc(a.asset_id)}">Attest still needed</button></td>`;
       tb.appendChild(tr);
     });
     t.appendChild(tb); rcc.appendChild(t);
@@ -1334,13 +2161,91 @@ async function renderGovernance() {
   });
 }
 
+// Reconcile: registry (desired state) vs the workspace (observed state). This is the
+// reconcile loop that replaces a Terraform state file, so it has to be visible, not just
+// an endpoint. Read-only against the workspace, and it demos with no access at all
+// because simulated assets support injected drift.
+function renderReconcile(v) {
+  v.appendChild(el("div", { class: "section-title" },
+    "<h2>Reconcile (desired vs actual)</h2><span class=\"pill\">read-only</span>"));
+  const c = el("div", { class: "card" });
+  c.innerHTML = `
+    <p class="muted" style="font-size:12px">PAVE's registry is the desired state and this sweep is the reconcile loop —
+      the reason there is no per-request Terraform state file. It reads live tags back and reports drift,
+      assets that vanished, and PAVE-tagged resources nobody vended.</p>
+    <div class="row"><button class="btn small" id="rc-run">Run reconcile</button>
+      <button class="btn ghost small" id="rc-drift">Simulate drift on an asset</button>
+      <button class="btn ghost small" id="rc-clear">Clear simulated drift</button></div>
+    <div id="rc-out" style="margin-top:10px"></div>`;
+  v.appendChild(c);
+  const out = c.querySelector("#rc-out");
+  const run = async () => {
+    out.innerHTML = `<p class="muted">Reading live state…</p>`;
+    try {
+      const r = await api("/api/governance/reconcile", { method: "POST" });
+      const rows = [
+        ["In sync", r.in_sync, "good"],
+        ["Tag drift", (r.drifted || []).length, "warn"],
+        ["Tracked but gone", (r.missing || []).length, "warn"],
+        ["Untracked (shadow IT)", (r.untracked || []).length, "warn"],
+        ["Unreadable", (r.unreadable || []).length, ""],
+      ];
+      out.innerHTML = `<div class="grid cols-4">${rows.map(([k, n, cls]) =>
+        `<div class="card"><div class="muted">${esc(k)}</div><div class="kpi ${n ? cls : 'good'}">${esc(n)}</div></div>`).join("")}</div>`
+        + (r.drifted || []).map(d => `<div class="audit-ev"><span class="mono">${esc(d.asset_id)}</span> ${esc(d.type)} · ` +
+            (d.tag_drift || []).map(t => `<span class="pill tier2">${esc(t.key)}: expected ${esc(t.expected)}, found ${esc(t.actual || "(missing)")}</span>`).join(" ") +
+          `</div>`).join("")
+        + (r.missing || []).map(m => `<div class="audit-ev"><span class="mono">${esc(m.asset_id)}</span> ${esc(m.type)} · <span class="pill tier2">gone from the workspace</span></div>`).join("")
+        + (r.untracked || []).map(u => `<div class="audit-ev"><span class="mono">${esc(u.name)}</span> · <span class="pill tier2">PAVE-tagged but not in the registry</span></div>`).join("")
+        + (r.unreadable || []).map(u => `<div class="audit-ev"><span class="mono">${esc(u.asset_id)}</span> · <span class="pill">could not read: ${esc(reasonLabel(u.reason))}</span></div>`).join("");
+    } catch (e) { out.innerHTML = `<div class="errors">${esc((e.body && e.body.error) || "reconcile failed")}</div>`; }
+  };
+  c.querySelector("#rc-run").onclick = run;
+  c.querySelector("#rc-drift").onclick = async () => {
+    const id = prompt("Asset id to drift (from the registry):");
+    if (!id) return;
+    const key = prompt("Tag key to strip (e.g. cost_center):", "cost_center");
+    if (!key) return;
+    try { await api(`/api/governance/drift/simulate/${id}?untag=${encodeURIComponent(key)}`, { method: "POST" });
+      toast(`Drift injected on ${id}`); run(); }
+    catch (e) { toast((e.body && e.body.error) || "could not inject drift", false); }
+  };
+  c.querySelector("#rc-clear").onclick = async () => {
+    try { await api("/api/governance/drift/simulate", { method: "DELETE" }); toast("Simulated drift cleared"); run(); }
+    catch (e) { toast("clear failed", false); }
+  };
+}
+
 // ===================================================================== FINOPS
 async function renderFinops() {
   const v = document.getElementById("view-finops");
   v.innerHTML = `<h1>FinOps &amp; Well-Architected</h1><p class="sub">Cost attribution from tags + ROI + live Well-Architected Lakehouse scorecard.</p>`;
-  const [s, sc, imp, ai] = await Promise.all([
-    api("/api/finops/summary"), api("/api/finops/scorecard"),
-    api("/api/finops/impact"), api("/api/finops/ai")]);
+
+  let s, sc, imp, ai;
+  try { s = await api("/api/finops/summary"); }
+  catch (e) {
+    v.appendChild(el("div", { class: "card" },
+      `<b>FinOps summary unavailable</b> (${e.status})`));
+    s = { tag_coverage_pct: 0, total_estimated_monthly: 0, active_assets: 0, untagged_cost: 0, by_cost_center: {}, by_project: {}, by_business_domain: {} };
+  }
+  try { sc = await api("/api/finops/scorecard"); }
+  catch (e) {
+    v.appendChild(el("div", { class: "card" },
+      `<b>Well-Architected scorecard unavailable</b> (${e.status})`));
+    sc = { overall_score: 0, pillars: [] };
+  }
+  try { imp = await api("/api/finops/impact"); }
+  catch (e) {
+    v.appendChild(el("div", { class: "card" },
+      `<b>Business impact metrics unavailable</b> (${e.status})`));
+    imp = { tickets_eliminated: 0, manual_baseline_days: 0, engineer_days_saved: 0, dollars_saved: 0, speedup_x: 0, pave_minutes: 0, measured: {} };
+  }
+  try { ai = await api("/api/finops/ai"); }
+  catch (e) {
+    v.appendChild(el("div", { class: "card" },
+      `<b>AI governance metrics unavailable</b> (${e.status})`));
+    ai = {};
+  }
 
   // ROI banner — the days->minutes story
   const roi = el("div", { class: "grid cols-4" });
@@ -1351,20 +2256,31 @@ async function renderFinops() {
     <div class="card"><div class="muted">Cost avoided</div><div class="kpi good">$${imp.dollars_saved.toLocaleString()}</div></div>
     <div class="card"><div class="muted">Speed-up</div><div class="kpi">${imp.speedup_x.toLocaleString()}×</div>
       <div class="muted" style="font-size:11px">days → ~${imp.pave_minutes} min</div></div>`;
-  v.appendChild(el("div", { class: "section-title" }, "<h2>Business impact (days → minutes)</h2>"));
+  // Labelled as modelled, and kept away from the system-table panels below: real numbers
+  // sitting next to unlabelled assumptions make the real ones look invented too.
+  v.appendChild(el("div", { class: "section-title" },
+    `<h2>Business impact (days → minutes)</h2><span class="pill">modelled</span>`));
+  v.appendChild(el("p", { class: "muted", style: "font-size:12px;margin:-2px 0 8px" },
+    `Modelled from ${esc((imp.measured || {}).requests_provisioned ?? 0)} provisioned request(s) using house assumptions: ` +
+    `${esc(imp.manual_baseline_days)}-day manual baseline, $${esc((imp.assumptions || {}).engineer_day_cost_usd)}/engineer-day. ` +
+    `Replace with the customer's own cycle time before quoting.`));
   v.appendChild(roi);
 
   const kpis = el("div", { class: "grid cols-4" });
   const covClass = s.tag_coverage_pct >= 95 ? "good" : "warn";
   kpis.innerHTML = `
-    <div class="card"><div class="muted">Est. monthly cost</div><div class="kpi">$${s.total_estimated_monthly}</div></div>
-    <div class="card"><div class="muted">Active assets</div><div class="kpi">${s.active_assets}</div></div>
-    <div class="card"><div class="muted">Tag coverage</div><div class="kpi ${covClass}">${s.tag_coverage_pct}%</div>
-      <div class="bar"><span style="width:${s.tag_coverage_pct}%"></span></div></div>
-    <div class="card"><div class="muted">Untagged cost</div><div class="kpi ${s.untagged_cost ? 'warn' : 'good'}">$${s.untagged_cost}</div></div>`;
+    <div class="card"><div class="muted">Est. monthly cost</div><div class="kpi">$${esc(s.total_estimated_monthly)}</div>
+      <div class="muted" style="font-size:11px">rate-card estimate, not billed spend</div></div>
+    <div class="card"><div class="muted">Active assets</div><div class="kpi">${esc(s.active_assets)}</div></div>
+    <div class="card"><div class="muted">Required tags on PAVE assets</div><div class="kpi ${covClass}">${esc(s.tag_coverage_pct)}%</div>
+      <div class="bar"><span style="width:${Number(s.tag_coverage_pct) || 0}%"></span></div>
+      <div class="muted" style="font-size:11px">~100% by construction — see attribution below</div></div>
+    <div class="card"><div class="muted">Untagged cost</div><div class="kpi ${s.untagged_cost ? 'warn' : 'good'}">$${esc(s.untagged_cost)}</div></div>`;
   v.appendChild(kpis);
 
-  v.appendChild(el("div", { class: "section-title" }, "<h2>Attribution completeness</h2>"));
+  await renderAttribution(v);
+
+  v.appendChild(el("div", { class: "section-title" }, "<h2>Estimated cost by tag (PAVE assets)</h2>"));
   v.appendChild(el("p", { class: "muted", style: "font-size:12px;margin:-2px 0 8px" },
     "PAVE's lens sits ABOVE Databricks FinOps: it guarantees every $ is attributable. Cost reporting itself lives in the native AI/BI Usage Dashboard."));
   const cc = el("div", { class: "grid cols-3" });
@@ -1387,8 +2303,8 @@ async function renderFinops() {
     const teams = Object.entries(ai.by_team || {});
     tcard.innerHTML = `<h3>Per-team AI spend vs budget</h3>` + (teams.length ? `<table>
       <thead><tr><th>Team / domain</th><th>Endpoints</th><th>Est. $/mo</th><th>Budget</th><th>Status</th></tr></thead>
-      <tbody>${teams.map(([t, r]) => `<tr><td>${t}</td><td>${r.endpoints}</td><td>$${r.est_spend}</td>
-        <td>${r.budget ? '$' + r.budget : '—'}</td>
+      <tbody>${teams.map(([t, r]) => `<tr><td>${esc(t)}</td><td>${esc(r.endpoints)}</td><td>$${esc(r.est_spend)}</td>
+        <td>${r.budget ? '$' + esc(r.budget) : '—'}</td>
         <td>${r.over_budget ? '<span class="pill tier2">over budget</span>' : '<span class="pill real">ok</span>'}</td></tr>`).join("")}</tbody></table>`
       : `<p class="muted">No AI assets yet.</p>`);
     v.appendChild(tcard);
@@ -1417,21 +2333,54 @@ async function renderFinops() {
     const findings = p.open_findings
       ? `<span class="pill tier2">${p.open_findings} open finding${p.open_findings > 1 ? 's' : ''}</span>`
       : `<span class="pill real">clean</span>`;
-    c.innerHTML = `<div class="flex"><h3>${p.pillar}</h3><span class="right kpi ${cls}" style="font-size:20px">${p.score}</span></div>
-      <div class="bar"><span style="width:${p.score}%"></span></div>
-      <div class="tagset" style="margin-top:8px">${p.controls.map(x => `<span class="kv">${x}</span>`).join("")}</div>
+    c.innerHTML = `<div class="flex"><h3>${esc(p.pillar)}</h3><span class="right kpi ${cls}" style="font-size:20px">${esc(p.score)}</span></div>
+      <div class="bar"><span style="width:${Number(p.score) || 0}%"></span></div>
+      <div class="tagset" style="margin-top:8px">${p.controls.map(x => `<span class="kv">${esc(x)}</span>`).join("")}</div>
       <p class="muted" style="font-size:12px;margin-top:8px">${findings}</p>`;
     pg.appendChild(c);
   });
   v.appendChild(pg);
 }
+// The honest tag-coverage metric: PAVE-attributed spend over TOTAL spend. Measuring
+// coverage over PAVE's own assets answers a question nobody asked (they are tagged by
+// construction); the denominator has to be the whole estate for the number to move.
+async function renderAttribution(v) {
+  v.appendChild(el("div", { class: "section-title" },
+    `<h2>Attribution completeness</h2><span class="pill">system.billing.usage</span>`));
+  const c = el("div", { class: "card" });
+  c.innerHTML = `<p class="muted">Reading billing system tables…</p>`;
+  v.appendChild(c);
+  let a;
+  try { a = await api("/api/finops/attribution"); }
+  catch (e) { a = { source: "unavailable", reason: (e.body && e.body.error) || "request failed" }; }
+  if (a.source !== "system.billing.usage") {
+    c.innerHTML = `<div class="flex"><h3>Not available here</h3><span class="right pill">no billing access</span></div>
+      <p class="muted" style="font-size:12px">${esc(a.reason || "")}. This metric is deliberately NOT estimated from
+        PAVE's own registry — doing so would beg the question, since PAVE tags everything it vends.
+        ${esc(a.note || "")}</p>`;
+    return;
+  }
+  const pct = a.attribution_completeness_pct;
+  c.innerHTML = `
+    <div class="flex"><h3>${esc(pct)}% of ${esc(a.window_days)}-day spend carries a PAVE project_id</h3>
+      <span class="right kpi ${pct >= 80 ? "good" : "warn"}">$${esc(a.unattributed_cost)} unattributed</span></div>
+    <div class="bar"><span style="width:${Number(pct) || 0}%"></span></div>
+    <p class="muted" style="font-size:12px">${esc(a.interpretation)}</p>
+    ${(a.top_unattributed || []).length ? `<table>
+      <thead><tr><th>SKU</th><th>Workspace</th><th>Unattributed $</th></tr></thead>
+      <tbody>${a.top_unattributed.map(r =>
+        `<tr><td>${esc(r.sku_name)}</td><td class="mono">${esc(r.workspace_id)}</td><td>$${esc(r.list_cost)}</td></tr>`).join("")}</tbody>
+      </table>` : ""}`;
+}
+
 function costCard(title, obj) {
   const entries = Object.entries(obj || {}).sort((a, b) => b[1] - a[1]);
   const max = Math.max(1, ...entries.map(e => e[1]));
   const c = el("div", { class: "card" });
-  c.innerHTML = `<h3>${title}</h3>` + (entries.length ? entries.map(([k, val]) =>
-    `<div style="margin:6px 0"><div class="flex"><span class="mono">${k}</span><span class="right">$${val}</span></div>
-     <div class="bar"><span style="width:${100 * val / max}%"></span></div></div>`).join("") : `<p class="muted">No data yet.</p>`);
+  // Keys here are requester-supplied (cost_center, project_id, business_domain).
+  c.innerHTML = `<h3>${esc(title)}</h3>` + (entries.length ? entries.map(([k, val]) =>
+    `<div style="margin:6px 0"><div class="flex"><span class="mono">${esc(k)}</span><span class="right">$${esc(val)}</span></div>
+     <div class="bar"><span style="width:${Number(100 * val / max) || 0}%"></span></div></div>`).join("") : `<p class="muted">No data yet.</p>`);
   return c;
 }
 
@@ -1443,11 +2392,12 @@ function wafPanel(waf) {
   let html = `<div class="card" style="margin-top:10px;background:rgba(255,255,255,.02)">
     <div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.5px">Well-Architected controls</div>`;
   if (def.length) html += `<div class="tagset" style="margin-top:6px">${def.map(d =>
-    `<span class="kv" title="${d.pillar}">✓ ${d.key} = ${JSON.stringify(d.value)}</span>`).join("")}</div>`;
+    `<span class="kv" title="${esc(d.pillar)}">✓ ${esc(d.key)} = ${esc(JSON.stringify(d.value))}</span>`).join("")}</div>`;
   if (find.length) html += `<div class="tagset" style="margin-top:6px">${find.map(f =>
-    `<span class="pill tier2" title="${(f.remediation || '').replace(/"/g, "'")}">⚠ ${f.rule_id}: ${f.title}</span>`).join("")}</div>`;
+    `<span class="pill tier2" title="${esc(f.remediation || '')}">⚠ ${esc(f.rule_id)}: ${esc(f.title)}</span>`).join("")}</div>`;
+  // Waiver justification is free text typed by the requester and read by the approver.
   if (waived.length) html += `<div class="tagset" style="margin-top:6px">${waived.map(w =>
-    `<span class="pill" title="${(w.justification || '').replace(/"/g, "'")}">waived: ${w.rule_id}</span>`).join("")}</div>`;
+    `<span class="pill" title="${esc(w.justification || '')}">waived: ${esc(w.rule_id)}</span>`).join("")}</div>`;
   return html + `</div>`;
 }
 
@@ -1456,8 +2406,8 @@ function switchView(name) {
   document.querySelectorAll(".view").forEach(v => v.classList.add("hidden"));
   document.getElementById(`view-${name}`).classList.remove("hidden");
   document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.view === name));
-  ({ intake: renderIntake, approvals: renderApprovals, registry: renderRegistry,
-     governance: renderGovernance, finops: renderFinops }[name])();
+  ({ intake: renderIntake, requests: renderRequests, approvals: renderApprovals,
+     registry: renderRegistry, governance: renderGovernance, finops: renderFinops }[name])();
 }
 
 async function boot() {
@@ -1476,10 +2426,12 @@ async function boot() {
   try {
     [OPTS, TEMPLATES] = await Promise.all([api("/api/meta/form-options"), api("/api/meta/templates")]);
     try { WORKSPACES = (await api("/api/meta/workspaces")).workspaces || WORKSPACES; } catch (e) { /* keep default */ }
+    renderPosture();    // state up front what this deployment really does
     renderIntake();
     handleDeepLink();   // honor #approvals/{id} from an approval email
   } catch (e) {
-    document.getElementById("view-intake").innerHTML = `<div class="errors">Failed to load PAVE metadata.</div>`;
+    document.getElementById("view-intake").innerHTML =
+      `<div class="errors">Failed to load PAVE metadata. <button class="btn ghost small" onclick="location.reload()">Retry</button></div>`;
   }
 }
 

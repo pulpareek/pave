@@ -104,7 +104,7 @@ class SchemaDabsProvider(Provider):
             logger.warning("post-deploy tagging failed for %s: %s", full_name, e)
 
         return ProvisionResult(
-            asset_id=new_asset_id("schema", project_id),
+            asset_id=new_asset_id("schema", project_id, context),
             type="schema",
             names={"name": schema_name, "catalog": catalog, "full_name": full_name,
                    "bundle_dir": d, "bundle_target": target},

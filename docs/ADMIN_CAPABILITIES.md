@@ -204,3 +204,61 @@ documents each):
    groups, budget policy, secret scope) before it accepts any project.
 3. **Fleet-wide governance rollup** — tag coverage / untagged spend / drift **across all
    workspaces**, not one. PAVE's current views are single-workspace.
+
+---
+
+## 9. Account service principal — when you need one & exactly where to wire it
+
+**TL;DR** — the deployed app runs as its **workspace-scoped app service principal**, which can only
+create assets *in its own workspace*. The moment PAVE must **create a new workspace** or
+**provision into a different workspace**, it needs an **account-level service principal** (account
+admin). This section is the deploy-time checklist. **A single-workspace deployment needs none of
+it** — cross-workspace/account calls simply degrade to simulated and keep working.
+
+### 9.1 Do you actually need it?
+
+| You want to… | Account SP required? | Identity that acts |
+|---|---|---|
+| Provision schema / cluster / app / lakebase / warehouse / endpoint **in the app's own workspace** | **No** | app SP (works out of the box) |
+| Provision assets **into another existing workspace** (`target_workspace`) | **Yes** (or a per-target SP) | account SP entitled in that ws |
+| **Create a new workspace** (`AccountClient.workspaces.create`) | **Yes — account admin** | account SP with account-admin |
+| Assign metastore / set budget policy / fleet governance | **Yes** | account SP |
+
+### 9.2 What to create (one-time, by an account admin)
+
+1. **Account service principal** — account console → Settings → Identity → Service principals.
+   Enable **OAuth (M2M)** → generate **client_id + secret**.
+2. **Account-admin** role on that SP (workspace creation / metastore / budget). Scope tightly.
+3. **Assign the SP into every target workspace** it must provision into, with the workspace
+   entitlements it needs (cluster-create + the UC privileges). For workspaces PAVE *vends*, do this
+   as part of the vend (see step 6 below).
+4. **Store the secret in a Databricks secret scope** — never a literal in `app.yaml`:
+   ```
+   databricks secrets create-scope pave
+   databricks secrets put-secret pave provisioner_client_secret
+   ```
+
+### 9.3 Where to wire it in PAVE (the changes a deployer makes)
+
+| # | File / location | Change required |
+|---|---|---|
+| 1 | `src/app/app.yaml` (env) | Add `DATABRICKS_ACCOUNT_ID`, `PAVE_PROVISIONER_CLIENT_ID`, `PAVE_PROVISIONER_SECRET` (the secret via a **bound secret** `valueFrom`, not a literal), `METASTORE_ID`, and the approved `PAVE_TARGET_WORKSPACES` (comma-sep hosts). Keep the **public** `app.yaml` scrubbed. |
+| 2 | `src/app/backend/config.py` | Add getters for the above (`ACCOUNT_ID`, `PROVISIONER_CLIENT_ID`, `PROVISIONER_SECRET`) reading from env — mirror the existing `get_db_password()` pattern. |
+| 3 | `src/app/backend/providers/_sdk.py` → `client(target_workspace)` | **The auth seam.** Today the target path uses **ambient** auth (only works same-account + SP already entitled). Build `WorkspaceClient(host=host, client_id=…, client_secret=…)` from the account-SP creds for any target host. Options (a) per-target SP and (b) account federation are both stubbed in-file. |
+| 4 | `src/app/backend/providers/workspace.py` | `AccountClient()` is currently ambient — construct it with the account-SP creds + `account_id`; pass `credentials_id` / `storage_config_id` for classic workspaces (customer-registered cloud IAM/storage — see §7.1). |
+| 5 | `resources/pave_provisioning.job.yml` + `src/app/provision_runner.py` | Job mode already forwards provisioning policy as job params (the `PROVIDER_MODES` / `PARENT_CATALOG` passthrough). Forward the account-SP creds the **same way** (sourced from the secret scope) so the Job's engine builds the account/target clients. Do **not** rely on the Job's `run_as` for cross-workspace power — `run_as` only governs the home workspace. |
+| 6 | Vend-time bootstrap — `providers/workspace.py` + `providers/policies.py::bootstrap_policy_family` | When PAVE creates a workspace, bootstrap the provisioner SP **into** it (add principal + entitlements) and seed the cluster-policy family so provisioning there works immediately. `bootstrap_policy_family()` exists; add the SP-assignment step. |
+
+### 9.4 The model to keep (SoD at scale)
+
+- **The app SP stays low-privilege** — serves the UI, reads state, triggers the Job. It must **not**
+  hold account-admin creds.
+- **Only the provisioning engine (the Job) reads the account-SP secret** and builds `AccountClient`
+  + per-host `WorkspaceClient`. Privileged creds live with the provisioner, not the app — that *is*
+  the separation-of-duties boundary.
+- **Job mode is unchanged** by any of this — it's the execution/durability layer. Same
+  `PROVISION_MODE=job`; only the SDK clients inside become credential-injected instead of ambient.
+
+> **Current status:** the account-SP auth in `_sdk.client()` is **commented / ambient** — steps 1–6
+> are the code + config required to turn it on. The reference deployment runs single-workspace and
+> as the deploying user; that is a demo convenience, **not** the multi-workspace model above.

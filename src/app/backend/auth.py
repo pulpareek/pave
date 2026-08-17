@@ -11,6 +11,13 @@ Two identity sources:
 
 Role precedence: demo persona (if DEMO_PERSONAS on) -> APPROVERS env / forwarded
 groups -> DEV_ROLE. Disable personas in a hardened deploy with DEMO_PERSONAS=0.
+
+Persona switching lets any caller choose their own role, so it is a demo affordance
+and nothing else. ENVIRONMENT=production disables it unconditionally rather than
+trusting the two env vars to be set consistently — the previous default paired
+DEMO_PERSONAS=1 with ENVIRONMENT=production, which let any workspace user satisfy
+a compliance gate. `identity_mode()` reports which source is live so the UI can
+say so out loud.
 """
 import logging
 import os
@@ -18,11 +25,17 @@ from dataclasses import dataclass
 
 from fastapi import Request
 
-from .config import DEV_USER_EMAIL
+from .config import DEV_USER_EMAIL, ENVIRONMENT, IS_PRODUCTION
 
 logger = logging.getLogger("pave.auth")
 
-DEMO_PERSONAS = os.getenv("DEMO_PERSONAS", "1") in ("1", "true", "True", "yes")
+_PERSONAS_REQUESTED = os.getenv("DEMO_PERSONAS", "1") in ("1", "true", "True", "yes")
+# Production never honours a client-chosen role, whatever DEMO_PERSONAS says.
+DEMO_PERSONAS = _PERSONAS_REQUESTED and not IS_PRODUCTION
+if _PERSONAS_REQUESTED and IS_PRODUCTION:
+    logger.warning(
+        "DEMO_PERSONAS=1 ignored because ENVIRONMENT=production; identity comes from "
+        "the Databricks Apps proxy only. Set ENVIRONMENT=demo to use the persona switcher.")
 DEV_APPROVERS = {e.strip().lower() for e in os.getenv("DEV_APPROVERS", "").split(",") if e.strip()}
 APPROVERS = {e.strip().lower() for e in os.getenv("APPROVERS", "").split(",") if e.strip()}
 DEV_ROLE = os.getenv("DEV_ROLE", "")  # force a role locally: requester|approver|admin
@@ -42,6 +55,20 @@ class CurrentUser:
     is_approver: bool
     is_admin: bool
     persona: str = ""
+
+
+def identity_mode() -> dict:
+    """How identity is being established right now — surfaced in the UI so nobody
+    mistakes a demo-switched persona for a verified signed-in user."""
+    return {
+        "environment": ENVIRONMENT,
+        "source": "demo_persona" if DEMO_PERSONAS else "workspace_proxy",
+        "personas_enabled": DEMO_PERSONAS,
+        "personas_suppressed_by_environment": _PERSONAS_REQUESTED and not DEMO_PERSONAS,
+        "note": ("Roles are demo-switchable in this deployment; any caller can choose a "
+                 "persona. Not an access control." if DEMO_PERSONAS else
+                 "Roles derive from the signed-in workspace identity and its groups."),
+    }
 
 
 def _forwarded_email(request: Request) -> str:

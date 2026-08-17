@@ -28,6 +28,9 @@
         <button data-view="intake" class="tab active">
           <svg viewBox="0 0 24 24" class="ico"><path d="M12 5v14M5 12h14"/></svg> Intake
         </button>
+        <button data-view="requests" class="tab">
+          <svg viewBox="0 0 24 24" class="ico"><path d="M4 4h11l5 5v11H4z M15 4v5h5"/></svg> Requests
+        </button>
         <button data-view="approvals" class="tab">
           <svg viewBox="0 0 24 24" class="ico"><path d="M20 6L9 17l-5-5"/></svg> Approvals
         </button>
@@ -45,7 +48,7 @@
       <div class="sidebar-foot">
         <label>Acting as</label>
         <select id="persona">
-          <option value="requester">Lead developer (requester)</option>
+          <option value="requester">Pulkit Pareek (requester)</option>
           <option value="platform">Platform approver</option>
           <option value="compliance">Security &amp; compliance</option>
         </select>
@@ -59,8 +62,10 @@
         <div class="topbar-spacer"></div>
         <div class="tagline">Guardrails, not gatekeeping — days into minutes</div>
       </header>
+      <div id="posture-banner" class="posture hidden" role="status" aria-live="polite"></div>
       <main id="app">
         <section id="view-intake" class="view"></section>
+        <section id="view-requests" class="view hidden"></section>
         <section id="view-approvals" class="view hidden"></section>
         <section id="view-registry" class="view hidden"></section>
         <section id="view-governance" class="view hidden"></section>

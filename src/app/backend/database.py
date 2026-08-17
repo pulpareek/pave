@@ -226,8 +226,20 @@ class Database:
                 "risk_tier TEXT",
             ):
                 await c.execute(f"ALTER TABLE {S}.requests ADD COLUMN IF NOT EXISTS {col_def}")
+            # Part 11 signature manifestation (printed name, meaning, UTC timestamp, and
+            # the digest linking the signature to the record it signed).
+            await c.execute(
+                f"ALTER TABLE {S}.approvals ADD COLUMN IF NOT EXISTS signature JSONB "
+                f"NOT NULL DEFAULT '{{}}'::jsonb")
             await c.execute(f"ALTER TABLE {S}.assets ADD COLUMN IF NOT EXISTS recertified_at TIMESTAMPTZ")
             await c.execute(f"ALTER TABLE {S}.assets ADD COLUMN IF NOT EXISTS provenance JSONB NOT NULL DEFAULT '{{}}'::jsonb")
+            # Why an asset is in the mode it is in. Pre-existing rows predate the distinction,
+            # so they default to the benign "configured" reason rather than claiming real.
+            await c.execute(
+                f"ALTER TABLE {S}.assets ADD COLUMN IF NOT EXISTS mode_reason TEXT "
+                f"NOT NULL DEFAULT 'configured_simulated'")
+            await c.execute(
+                f"ALTER TABLE {S}.assets ADD COLUMN IF NOT EXISTS degraded BOOLEAN NOT NULL DEFAULT FALSE")
 
             await c.execute(f"CREATE INDEX IF NOT EXISTS idx_req_status ON {S}.requests(status, created_at DESC)")
             await c.execute(f"CREATE INDEX IF NOT EXISTS idx_asset_owner ON {S}.assets(owner_id)")
@@ -378,7 +390,29 @@ class Database:
         row = await p.fetchrow(
             f"UPDATE {S}.requests SET status=$2, updated_at=now() WHERE id=$1 RETURNING *",
             request_id, status)
-        return dict(row) if row else None
+        return _flatten(_coerce(dict(row), ("custom_tags", "resources", "metadata"))) if row else None
+
+    async def transition_request_status(self, request_id: str, *, expected: str,
+                                        new: str) -> Optional[dict]:
+        """Compare-and-swap a request's status; returns None if it had already moved.
+
+        Two approvers clicking at the same moment both used to read PENDING_APPROVAL,
+        both count enough approvals, and both trigger provisioning — creating the
+        footprint twice. Making the transition conditional means exactly one wins.
+        """
+        p = await self.pool()
+        if p is None:
+            r = await self.get_request(request_id)
+            if not r or r.get("status") != expected:
+                return None
+            r["status"] = new
+            r["updated_at"] = time.time()
+            return r
+        row = await p.fetchrow(
+            f"""UPDATE {S}.requests SET status=$3, updated_at=now()
+                WHERE id=$1 AND status=$2 RETURNING *""",
+            request_id, expected, new)
+        return _flatten(_coerce(dict(row), ("custom_tags", "resources", "metadata"))) if row else None
 
     async def set_request_resources(self, request_id: str, resources: list) -> Optional[dict]:
         """Replace a request's resources list (used when amending an existing project to add
@@ -413,11 +447,12 @@ class Database:
             self._mem["approvals"].append(a)
             return a
         row = await p.fetchrow(
-            f"""INSERT INTO {S}.approvals (request_id, approver, decision, reason, esignature, gate)
-                VALUES ($1,$2,$3,$4,$5,$6) RETURNING *""",
+            f"""INSERT INTO {S}.approvals
+                (request_id, approver, decision, reason, esignature, gate, signature)
+                VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *""",
             a["request_id"], a["approver"], a["decision"], a.get("reason"),
-            a.get("esignature"), a.get("gate"))
-        return dict(row)
+            a.get("esignature"), a.get("gate"), a.get("signature") or {})
+        return _coerce(dict(row), ("signature",))
 
     async def list_approvals(self, request_id: str) -> list[dict]:
         p = await self.pool()
@@ -425,7 +460,7 @@ class Database:
             return [a for a in self._mem["approvals"] if str(a.get("request_id")) == str(request_id)]
         rows = await p.fetch(
             f"SELECT * FROM {S}.approvals WHERE request_id=$1 ORDER BY signed_at", request_id)
-        return [dict(r) for r in rows]
+        return [_coerce(dict(r), ("signature",)) for r in rows]
 
     # ---- assets ---------------------------------------------------------
     async def add_asset(self, asset: dict) -> dict:
@@ -436,23 +471,27 @@ class Database:
         row = await p.fetchrow(
             f"""INSERT INTO {S}.assets
                 (asset_id, request_id, type, names, external_id, owner_id, project_id,
-                 applied_tags, mode, status, sunset_date, provenance)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                 applied_tags, mode, status, sunset_date, provenance, mode_reason, degraded)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
                 ON CONFLICT (asset_id) DO UPDATE
                   SET names=EXCLUDED.names, external_id=EXCLUDED.external_id,
                       applied_tags=EXCLUDED.applied_tags, status=EXCLUDED.status,
-                      provenance=EXCLUDED.provenance
+                      provenance=EXCLUDED.provenance, mode=EXCLUDED.mode,
+                      mode_reason=EXCLUDED.mode_reason, degraded=EXCLUDED.degraded
                 RETURNING *""",
             asset["asset_id"], asset.get("request_id"), asset["type"],
             asset.get("names") or {}, asset.get("external_id"),
             asset.get("owner_id"), asset.get("project_id"),
             asset.get("applied_tags") or {}, asset.get("mode", "simulated"),
             asset.get("status", "ACTIVE"), asset.get("sunset_date"),
-            asset.get("provenance") or {})
+            asset.get("provenance") or {},
+            asset.get("mode_reason") or "configured_simulated",
+            bool(asset.get("degraded")))
         return _coerce(dict(row), ("names", "applied_tags", "provenance"))
 
     async def list_assets(self, *, owner_id: Optional[str] = None, project_id: Optional[str] = None,
-                          status: Optional[str] = None, limit: int = 500) -> list[dict]:
+                          status: Optional[str] = None, request_id: Optional[str] = None,
+                          limit: int = 500) -> list[dict]:
         p = await self.pool()
         if p is None:
             rows = self._mem["assets"]
@@ -462,9 +501,12 @@ class Database:
                 rows = [a for a in rows if a.get("project_id") == project_id]
             if status:
                 rows = [a for a in rows if a.get("status") == status]
+            if request_id:
+                rows = [a for a in rows if str(a.get("request_id")) == str(request_id)]
             return rows[:limit]
         clauses, args = [], []
-        for col, val in (("owner_id", owner_id), ("project_id", project_id), ("status", status)):
+        for col, val in (("owner_id", owner_id), ("project_id", project_id),
+                         ("status", status), ("request_id", request_id)):
             if val:
                 args.append(val); clauses.append(f"{col}=${len(args)}")
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
@@ -473,9 +515,50 @@ class Database:
             f"SELECT * FROM {S}.assets{where} ORDER BY provisioned_at DESC LIMIT ${len(args)}", *args)
         return [_coerce(dict(r), ("names", "applied_tags", "provenance")) for r in rows]
 
+    async def find_active_asset_by_name(self, asset_type: str, name: str,
+                                        *, catalog: Optional[str] = None) -> Optional[dict]:
+        """Return an ACTIVE/PROVISIONING asset of this type already using `name`, else None.
+
+        Backs the registry-first uniqueness check (uniqueness.check_collisions). `catalog`
+        scopes schema lookups to their parent catalog. Matches the stored `names->>'name'`
+        (schemas also compare `names->>'catalog'`). Excludes decommissioned assets so a freed
+        name can be reused.
+        """
+        if not name:
+            return None
+        live = ("ACTIVE", "PROVISIONING", "PARTIAL")
+        p = await self.pool()
+        if p is None:
+            for a in self._mem["assets"]:
+                names = a.get("names") or {}
+                if (a.get("type") == asset_type and names.get("name") == name
+                        and a.get("status") in live
+                        and (catalog is None or names.get("catalog") == catalog)):
+                    return a
+            return None
+        rows = await p.fetch(
+            f"""SELECT * FROM {S}.assets
+                WHERE type=$1 AND names->>'name'=$2 AND status = ANY($3::text[])
+                  AND ($4::text IS NULL OR names->>'catalog'=$4)
+                LIMIT 1""",
+            asset_type, name, list(live), catalog)
+        return _coerce(dict(rows[0]), ("names", "applied_tags", "provenance")) if rows else None
+
+    # Columns update_asset is allowed to write. Column names cannot be parameterized, so
+    # they are interpolated into the UPDATE — an allow-list keeps that from ever becoming
+    # an injection point if a caller starts forwarding user-supplied keys.
+    _ASSET_UPDATABLE = frozenset({
+        "names", "external_id", "owner_id", "project_id", "applied_tags", "mode",
+        "mode_reason", "degraded", "status", "sunset_date", "provenance",
+        "recertified_at", "decommissioned_at",
+    })
+
     async def update_asset(self, asset_id: str, **fields: Any) -> Optional[dict]:
         if not fields:
             return None
+        unknown = set(fields) - self._ASSET_UPDATABLE
+        if unknown:
+            raise ValueError(f"update_asset: not an updatable column: {sorted(unknown)}")
         p = await self.pool()
         if p is None:
             a = next((x for x in self._mem["assets"] if x.get("asset_id") == asset_id), None)

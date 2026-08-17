@@ -8,8 +8,9 @@ import logging
 from typing import Any
 
 from . import _sdk
-from .base import Provider, ProvisionResult, new_asset_id
+from .base import Provider, ProviderUnavailable, ProvisionResult, classify_error, new_asset_id
 from .. import config
+from .. import naming
 
 logger = logging.getLogger("pave.provider.schema")
 
@@ -22,7 +23,7 @@ class SchemaProvider(Provider):
         cfg = resource.get("config", {})
         project_id = request.get("project_id", "proj")
         catalog = request.get("parent_catalog") or config.PARENT_CATALOG
-        schema_name = cfg.get("name") or f"{request.get('business_domain','proj')}_{project_id.split('-')[-1]}"
+        schema_name = naming.resolve_name("schema", request, cfg)
         full_name = f"{catalog}.{schema_name}"
 
         # Route to the request's TARGET workspace (empty -> the app's own). See
@@ -33,17 +34,29 @@ class SchemaProvider(Provider):
         storage_root = cfg.get("storage_root") or None
         comment = cfg.get("comment") or f"PAVE: {request.get('project_name','')} ({project_id})"
 
-        w = _sdk.client(request.get("target_workspace"))
-        # 1) create (idempotent)
+        target = request.get("target_workspace")
+        w = _sdk.client(target)
+        # 1) create (idempotent — an "already exists" error means adopt)
+        create_err = None
         try:
             kwargs = {"name": schema_name, "catalog_name": catalog, "comment": comment}
             if storage_root:
                 kwargs["storage_root"] = storage_root
             w.schemas.create(**kwargs)
-        except Exception as e:  # noqa: BLE001 — likely already exists; adopt it
-            logger.info("schema %s create skipped/adopted: %s", full_name, e)
-
-        target = request.get("target_workspace")
+        except Exception as e:  # noqa: BLE001 — "already exists" (adopt) OR a real failure
+            create_err = e
+            logger.info("schema %s create raised: %s", full_name, e)
+        # Verify it exists before claiming we made it. Without this read-back a permission
+        # denial is indistinguishable from a successful adopt, and the asset would report
+        # a real ACTIVE schema that is not in the catalog.
+        if create_err is not None:
+            try:
+                w.schemas.get(full_name=full_name)
+            except Exception as e:  # noqa: BLE001
+                raise ProviderUnavailable(
+                    f"schema '{full_name}' was not created and does not exist "
+                    f"(create error: {create_err})",
+                    reason=classify_error(create_err)) from e
         # 2) tags (governed-style, dual-plane key vocabulary)
         tag_result = _sdk.apply_uc_tags("schemas", full_name, tag_set, target_workspace=target)
 
@@ -61,7 +74,7 @@ class SchemaProvider(Provider):
                 grant_result = {"granted": 0, "error": str(e)}
 
         return ProvisionResult(
-            asset_id=new_asset_id("schema", project_id),
+            asset_id=new_asset_id("schema", project_id, context),
             type="schema",
             names={"name": schema_name, "catalog": catalog, "full_name": full_name,
                    "storage": storage_root or "managed (inherited)"},
@@ -77,4 +90,5 @@ class SchemaProvider(Provider):
         if not full_name:
             return
         # Classification-aware: drop only if not GxP-retained (checked by service).
-        _sdk.client().schemas.delete(full_name=full_name)
+        # Must target the workspace the schema was vended INTO, not the app's own.
+        _sdk.client(context.get("target_workspace")).schemas.delete(full_name=full_name)

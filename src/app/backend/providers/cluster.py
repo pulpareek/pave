@@ -10,6 +10,7 @@ import uuid
 from typing import Any
 
 from .base import Provider, ProvisionResult, new_asset_id
+from .. import naming
 from ..well_architected import COMPUTE_DEFAULTS, RESTRICTED_ACCESS_MODE
 
 
@@ -70,12 +71,14 @@ class SimulatedComputeProvider(Provider):
             enforced["availability"] = cfg.get("availability", "SPOT_WITH_FALLBACK")
         synthetic_id = f"sim-{self.resource_type}-{uuid.uuid4().hex[:12]}"
         return ProvisionResult(
-            asset_id=new_asset_id(self.resource_type, project_id),
+            asset_id=new_asset_id(self.resource_type, project_id, context),
             type=self.resource_type,
-            names={"name": cfg.get("name") or f"{self.resource_type}-{project_id}", **enforced},
+            names={"name": naming.resolve_name(self.resource_type, request, cfg), **enforced},
             external_id=synthetic_id,
             applied_tags=tag_set,
             mode="simulated",
+            mode_reason="configured_simulated",
+            degraded=False,
             status="ACTIVE",
             provenance={"policy_enforced": enforced},
         )

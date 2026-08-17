@@ -1,11 +1,16 @@
 """Form metadata + golden-path templates for the intake UI."""
-import os
+import asyncio
+import logging
 
 from fastapi import APIRouter
 
+from .. import config, naming
+from ..providers import _sdk
+
+logger = logging.getLogger("pave.meta")
 from ..models import (
     DataClassification, Environment, ResourceType, BUSINESS_DOMAINS, BUSINESS_TAXONOMY,
-    COMPLIANCE_SCOPES, REGIONS, DATA_RETENTION_CLASSES, REQUIRED_TAG_KEYS,
+    COMPLIANCE_SCOPES, REGIONS, DATA_RETENTION_CLASSES, REQUIRED_TAG_KEYS, MEDALLION_LAYERS,
     OPTIONAL_TAG_KEYS, ALLOWED_CUSTOM_TAG_KEYS,
     DEPARTMENTS, LIFECYCLE_STAGES, SLA_TIERS, COST_TYPES, SECURITY_REVIEW_STATUSES,
     AI_PROVIDERS, ALLOWED_AI_MODELS, AI_TASKS, AI_GUARDRAILS, AIRiskTier,
@@ -13,6 +18,7 @@ from ..models import (
     CATALOG_KINDS, ISOLATION_MODES, APP_COMPUTE_SIZES, APP_BINDABLE_RESOURCES,
     LAKEBASE_OFFERINGS, LAKEBASE_CAPACITIES, PG_VERSIONS, LLM_THROUGHPUT_MODES,
     VS_INDEX_TYPES, VS_EMBEDDING_SOURCES, VS_PIPELINE_TYPES, EMBEDDING_MODELS,
+    WAREHOUSE_SIZES, WAREHOUSE_TYPES,
 )
 from ..validation import KNOWN_COST_CENTERS
 
@@ -101,6 +107,7 @@ async def form_options():
         "resource_types": [r.value for r in ResourceType],
         "business_domains": BUSINESS_DOMAINS,
         "business_taxonomy": BUSINESS_TAXONOMY,
+        "medallion_layers": MEDALLION_LAYERS,
         "compliance_scopes": COMPLIANCE_SCOPES,
         "regions": REGIONS,
         "data_retention_classes": DATA_RETENTION_CLASSES,
@@ -137,10 +144,17 @@ async def form_options():
         "vs_embedding_sources": VS_EMBEDDING_SOURCES,
         "vs_pipeline_types": VS_PIPELINE_TYPES,
         "embedding_models": EMBEDDING_MODELS,
+        "warehouse_sizes": WAREHOUSE_SIZES,
+        "warehouse_types": WAREHOUSE_TYPES,
         # pre-approved external locations for catalog/schema (env PAVE_EXTERNAL_LOCATIONS,
         # comma-separated names). NEVER free-form s3://; requester picks from this list.
-        "pre_approved_locations": [x.strip() for x in
-                                   os.getenv("PAVE_EXTERNAL_LOCATIONS", "").split(",") if x.strip()],
+        "pre_approved_locations": config.external_locations(),
+        # ---- naming convention (templates surfaced so the form can preview + hint) ----
+        "naming_preset": naming._preset(),
+        "group_prefix": naming.group_prefix(),
+        "naming_templates": {rt: naming.convention_hint(rt) for rt in
+                             [r.value for r in ResourceType]},
+        "owner_group_template": naming.convention_hint("owner_group"),
         "acknowledgements": [
             {"key": "cost-ownership", "label": "I accept cost ownership for these resources"},
             {"key": "data-handling", "label": "I will handle data per its classification"},
@@ -168,15 +182,84 @@ async def workspaces():
 
     Offline/demo: the app's own workspace plus any hosts in PAVE_TARGET_WORKSPACES
     (comma-separated) so the picker is demoable without account access.
+
+    This is the same list validation.py enforces on submit, so the picker cannot drift
+    from what the server will actually accept.
     """
-    import os
     out = [{"host": "", "label": "This workspace (default)", "self": True}]
-    for h in [x.strip() for x in os.getenv("PAVE_TARGET_WORKSPACES", "").split(",") if x.strip()]:
+    for h in config.target_workspaces():
         label = h.replace("https://", "").split(".")[0]
         out.append({"host": h, "label": label, "self": False})
     return {"workspaces": out}
 
 
+@router.get("/groups")
+async def groups(workspace: str = ""):
+    """Databricks groups for the owning-group picker (the principal PAVE grants to).
+
+    Lists groups visible in the target workspace via workspace SCIM. Best-effort:
+    {groups, source, resolvable}. On any failure (no perms / offline / unapproved host)
+    returns an empty list with resolvable=False, and the SPA falls back to a free-text
+    field + the new-group naming convention. Account-wide listing (cross-workspace /
+    new-workspace vending) needs the account service principal — docs/ADMIN_CAPABILITIES §9.
+    """
+    names = await asyncio.to_thread(_sdk.list_groups, workspace or None)
+    return {"groups": names, "source": "workspace_scim" if names else "unavailable",
+            "resolvable": bool(names)}
+
+
 @router.get("/templates")
 async def templates():
     return TEMPLATES
+
+
+@router.get("/posture")
+async def posture():
+    """What this deployment will and will not actually do.
+
+    The UI renders this as a persistent banner. A governed-provisioning demo is only
+    credible if a reviewer can tell, before they trust a green ACTIVE, which resource
+    types are really created and which are modelled — and why.
+    """
+    from ..auth import identity_mode
+    from ..database import db
+    from ..models import ResourceType
+    from ..providers import MODE_REASONS, bind
+
+    # demo_mode resolves lazily on first connection attempt; force it so the banner is
+    # accurate on a cold page load rather than optimistically claiming persistence.
+    await db.health()
+
+    types = {}
+    for rt in [r.value for r in ResourceType]:
+        try:
+            b = bind(rt)
+            types[rt] = {"mode": b.mode, "reason": b.reason,
+                         "degraded": b.degraded,
+                         "explanation": MODE_REASONS.get(b.reason, b.reason)}
+        except Exception as e:  # noqa: BLE001 — never let the banner break the page
+            types[rt] = {"mode": "unknown", "reason": "sdk_error",
+                         "degraded": True, "explanation": str(e)[:200]}
+
+    real_types = sorted(k for k, v in types.items() if v["mode"] == "real")
+    return {
+        "environment": config.ENVIRONMENT,
+        "identity": identity_mode(),
+        "storage": {
+            "persistent": not db.demo_mode,
+            "backend": "lakebase" if not db.demo_mode else "in-memory",
+            "note": ("Requests, approvals and the registry persist in Lakebase."
+                     if not db.demo_mode else
+                     "Running on in-memory state: everything is lost when the app restarts."),
+        },
+        "provisioning": {
+            "allow_real": config.ALLOW_REAL,
+            "mode": config.PROVISION_MODE,
+            "separation_of_duties": config.PROVISION_MODE == "job",
+            "real_types": real_types,
+            "summary": (f"Really creates: {', '.join(real_types)}. Everything else is modelled."
+                        if real_types else
+                        "Every resource type is modelled; nothing is created in the workspace."),
+            "by_type": types,
+        },
+    }

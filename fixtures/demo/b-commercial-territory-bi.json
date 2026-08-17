@@ -1,0 +1,35 @@
+{
+  "use_case_name": "Field Sales Territory Dashboard",
+  "project_name": "commercial-territory-bi",
+  "description": "Sandbox for a field-sales territory performance dashboard built on aggregated, de-identified script volume.",
+  "justification": "Sales ops currently rebuilds territory rollups in spreadsheets each month. A governed sandbox lets the analytics team prototype before promoting to production.",
+  "owner_group": "dbx-commercial-dev-rw",
+  "business_owner": "dan.okafor@lifesci.example",
+  "business_domain": "commercial",
+  "business_function": "market_analytics",
+  "business_sub_function": "commercial_insights",
+  "department": "commercial",
+  "data_classification": "internal",
+  "environment": "dev",
+  "sunset_date": "2026-11-30",
+  "cost_center": "CC-1002",
+  "cost_type": "opex",
+  "budget_monthly_cap": 400,
+  "lifecycle_stage": "poc",
+  "resources": [
+    {
+      "type": "schema",
+      "config": {}
+    },
+    {
+      "type": "job_cluster",
+      "config": {
+        "compute_mode": "serverless"
+      }
+    }
+  ],
+  "acknowledgements": [
+    "cost-ownership",
+    "data-handling"
+  ]
+}

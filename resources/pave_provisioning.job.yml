@@ -18,15 +18,31 @@ resources:
     pave_provisioning_job:
       name: pave_provisioning_job
 
+      # Real email with NO SMTP relay: Databricks' OWN control-plane mailer sends these on
+      # run start/success/failure (the app can't call that internal mailer, but a Job can).
+      # Recipient comes from ${var.notification_email} (real value in the gitignored
+      # databricks.local.yml; "" in the public file). Because this is the SoD provisioning
+      # engine, these mark exactly when a real asset was created or a real create failed.
+      email_notifications:
+        on_start:
+          - ${var.notification_email}
+        on_success:
+          - ${var.notification_email}
+        on_failure:
+          - ${var.notification_email}
+
       # Let the app SP trigger this job without overriding its permissions on deploy.
       permissions:
         - level: CAN_MANAGE_RUN
-          service_principal_name: ${resources.apps.pave.service_principal_client_id}
+          service_principal_name: ${var.app_service_principal_app_id}
 
-      # Separation of duties: provisioning runs as a privileged SP, not the app
-      # SP or the requester. Leave run_as commented until a provisioner SP exists.
+      # NOTE on run_as: ideally the app SP (so Lakebase state + create perms match the
+      # in-process path), but setting run_as to it requires servicePrincipal.user on that SP,
+      # which the deploying user lacks here — so the Job runs as the DEPLOYING user. That
+      # works only if the deployer owns the Lakebase instance (can read the app-SP-created
+      # pave schema). True fix = a provisioner SP the deployer can bind. Left unset for now.
       # run_as:
-      #   service_principal_name: ${var.provisioner_sp}
+      #   service_principal_name: ${var.app_service_principal_app_id}
 
       parameters:
         - name: action
@@ -41,11 +57,40 @@ resources:
           default: ${var.parent_catalog}
         - name: lakebase_instance
           default: ${var.lakebase_instance_name}
+        # Provisioning policy forwarded from the app at run_now (see databricks_jobs.py).
+        # Defaults keep the Job simulated + catalog-safe if triggered without them.
+        - name: allow_real
+          default: "0"
+        - name: provider_modes
+          default: ""
+        - name: audit_catalog
+          default: ${var.parent_catalog}
+        # JSON list of net-new resources for action=add_resources (delta add / amendment).
+        - name: resources
+          default: ""
+        # Warehouse the budget-breach SQL Alert runs on (system.billing.usage query).
+        - name: warehouse_id
+          default: ${var.warehouse_id}
 
       tasks:
         - task_key: provision
           spark_python_task:
             python_file: ../src/app/provision_runner.py
+            # Job-level parameters are NOT auto-forwarded to a spark_python_task as argv;
+            # they must be referenced explicitly here as {{job.parameters.<name>}}. Without
+            # this the runner sees no request_id and exits "request_id is required".
+            parameters:
+              - "--action={{job.parameters.action}}"
+              - "--request_id={{job.parameters.request_id}}"
+              - "--catalog={{job.parameters.catalog}}"
+              - "--schema={{job.parameters.schema}}"
+              - "--parent_catalog={{job.parameters.parent_catalog}}"
+              - "--lakebase_instance={{job.parameters.lakebase_instance}}"
+              - "--allow_real={{job.parameters.allow_real}}"
+              - "--provider_modes={{job.parameters.provider_modes}}"
+              - "--audit_catalog={{job.parameters.audit_catalog}}"
+              - "--resources={{job.parameters.resources}}"
+              - "--warehouse_id={{job.parameters.warehouse_id}}"
           environment_key: default
 
       environments:
@@ -53,5 +98,8 @@ resources:
           spec:
             environment_version: "3"
             dependencies:
-              - databricks-sdk>=0.40.0
+              # Must match the app (src/app/requirements.txt): the runner calls w.database
+              # (Lakebase API) to resolve the state-store endpoint; SDK <0.40 lacks it and the
+              # Job silently falls back to empty in-memory demo_mode ("request not found").
+              - databricks-sdk>=0.125.0
               - asyncpg>=0.29.0

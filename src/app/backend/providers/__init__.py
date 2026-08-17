@@ -5,4 +5,7 @@ per-type mode (real | simulated). Real providers use the Databricks SDK; the
 mode is resolved from defaults + PROVIDER_MODES overrides so an operator can flip
 a type real<->simulated without code changes.
 """
-from .registry import get_provider, resolve_mode, DEFAULT_MODES  # noqa: F401
+from .base import MODE_REASONS, ProviderUnavailable, classify_error  # noqa: F401
+from .registry import (  # noqa: F401
+    Binding, DEFAULT_MODES, bind, get_provider, provision, resolve_mode,
+)

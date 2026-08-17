@@ -1,0 +1,70 @@
+{
+  "use_case_name": "Medical Affairs Protocol Assistant",
+  "project_name": "medaffairs-protocol-rag",
+  "description": "Governed LLM gateway plus a vector index over approved protocol documents so field medical can answer investigator questions with citations.",
+  "justification": "Field medical currently emails the medical information desk and waits a day. A retrieval-grounded assistant over approved documents cuts response time while keeping every answer traceable to a source.",
+  "owner_group": "dbx-clinical-prod-rw",
+  "business_owner": "priya.raman@lifesci.example",
+  "technical_lead": "ml.lead@lifesci.example",
+  "backup_owner": "ml.backup@lifesci.example",
+  "support_contact": "ai-oncall@lifesci.example",
+  "business_domain": "clinical",
+  "business_function": "medical_affairs",
+  "business_sub_function": "medical_information",
+  "department": "clinical-dev",
+  "data_classification": "confidential",
+  "environment": "prod",
+  "region": "us-east-1",
+  "data_retention": "7y",
+  "cost_center": "CC-4500",
+  "cost_type": "opex",
+  "budget_monthly_cap": 2500,
+  "lifecycle_stage": "pilot",
+  "sla_tier": "tier2",
+  "rto_hours": 8,
+  "rpo_hours": 4,
+  "security_review_status": "approved",
+  "ai_risk_tier": "limited",
+  "intended_use": "Retrieval-grounded Q&A over approved clinical protocol documents for field medical staff, with citations.",
+  "out_of_scope_uses": "No diagnosis, no treatment recommendations, no patient-facing output.",
+  "model_card_ref": "https://wiki.example/medaffairs-assistant-model-card",
+  "human_oversight": true,
+  "resources": [
+    {
+      "type": "llm_gateway_endpoint",
+      "config": {
+        "provider": "databricks",
+        "model": "databricks-claude-sonnet-4",
+        "task": "llm/v1/chat",
+        "guardrails": [
+          "pii_redact",
+          "safety"
+        ],
+        "throughput_mode": "pay_per_token",
+        "rate_limit_qpm": 100,
+        "rate_limit_tpm": 50000,
+        "monthly_token_budget": 5000000,
+        "monthly_cost_cap_usd": 2000,
+        "inference_logging": true
+      }
+    },
+    {
+      "type": "vector_search",
+      "config": {
+        "index_type": "DELTA_SYNC",
+        "embedding_source": "managed",
+        "pipeline_type": "TRIGGERED",
+        "embedding_model": "databricks-gte-large-en",
+        "source_table": "clinical.protocols.approved_docs"
+      }
+    },
+    {
+      "type": "schema",
+      "config": {}
+    }
+  ],
+  "acknowledgements": [
+    "cost-ownership",
+    "data-handling"
+  ]
+}

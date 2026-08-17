@@ -25,18 +25,49 @@ class RoutingDecision:
         Standard Changes (bypass CAB); higher tiers are Normal Changes."""
         return "standard" if self.risk_tier == RiskTier.TIER0 else "normal"
 
+    @property
+    def auto_approve(self) -> bool:
+        """A pre-authorized standard change needs no human approval.
+
+        This is what makes the golden path a golden path. Queuing a dev sandbox behind a
+        human reviewer just moves the ticket queue somewhere else; the point of tiering is
+        that low-risk requests execute against policy and reviewers only see exceptions.
+        The deployment can still decline to honour this (see config.AUTO_APPROVE_TIER0).
+        """
+        return self.change_type == "standard"
+
     def to_dict(self) -> dict:
         return {
             "risk_tier": self.risk_tier.value,
             "gates": self.gates,
             "requires_dual": self.requires_dual,
             "change_type": self.change_type,
+            "auto_approve": self.auto_approve,
+            "policy": STANDARD_CHANGE_POLICY if self.auto_approve else None,
             "rationale": self.rationale,
         }
 
 
 # Threshold (estimated monthly $) above which a request escalates to controlled.
 COST_ESCALATION_THRESHOLD = 2000
+
+# The pre-authorization that lets a Tier-0 request skip human approval. Kept as data so
+# the audit trail can name exactly what authorized a provision that nobody signed — the
+# first question an auditor asks about an unsigned change.
+STANDARD_CHANGE_POLICY = {
+    "id": "pave-standard-change-v1",
+    "name": "Pre-authorized standard change",
+    "itil_change_type": "standard",
+    "grants": "provision without human approval",
+    "preconditions": [
+        "environment is a dev sandbox",
+        "data classification is public or internal, with no PHI and no GxP scope",
+        "no new catalog and no new workspace",
+        f"estimated monthly cost at or below ${COST_ESCALATION_THRESHOLD}",
+        "passes intake validation, the uniqueness check and the Well-Architected gate",
+    ],
+    "review": "reviewed quarterly by the platform team; every use is audited",
+}
 
 
 def route(payload: RequestIn, *, estimated_cost: float = 0.0) -> RoutingDecision:

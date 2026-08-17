@@ -40,6 +40,52 @@ env.example               # copy to .env for local dev
   (the Databricks-managed vs customer-cloud two-plane model, phased plan).
 - [`docs/ADMIN_CAPABILITIES.md`](docs/ADMIN_CAPABILITIES.md) — account/workspace-admin capabilities + roadmap.
 
+## Why the SDK — not Terraform/DABs or the REST API — for provisioning?
+
+A fair question — IaC gives you versioning, declarative diff, `plan` previews, and rollback,
+and those are worth keeping. PAVE keeps them; it just doesn't put them in a state file *per
+request*. It **executes imperatively (SDK) and records declaratively**: every provisioned
+request emits a canonical desired-state manifest (`services/spec.py`,
+`GET /api/requests/{id}/spec`) into an append-only audit log, the Lakebase **registry is the
+desired-state store**, and the **governance sweep is the reconcile/drift loop** — so you get
+GitOps-grade auditability, diff, and lifecycle without a `.tf` file or bundle state per request.
+Generating Terraform/DABs per request would sprawl thousands of tiny state files, put the CLI in
+the request hot path, and fight lock contention at vending scale — the wrong tool for
+concurrent, user-driven provisioning. The **SDK is chosen over raw REST** for the same
+pragmatism: it's the same underlying control plane, but with typed models, auth/paging/retry
+handled, and one idiom across every resource — so there's no REST surface the SDK doesn't already
+cover for our scope. IaC is still used where it earns its keep: **Terraform** for the
+rarely-changing platform substrate (metastore/account) and **DABs** to deploy PAVE itself (plus
+an opt-in schema showcase). See [`docs/architecture/`](docs/architecture/README.md)
+(09-hybrid-provisioning, 10-reconcile-drift, 18-record-as-code) for the full rationale.
+
+## Where PAVE fits as Databricks goes serverless
+
+A reasonable challenge: *if serverless makes spinning up compute trivial, does a provisioning
+portal still matter?* It matters **more**, not less — because serverless removes the friction
+PAVE was never really about, and leaves the friction it *is* about.
+
+- **Compute config is fading, and PAVE follows it.** Node types, DBR pinning, autoscaling, spot
+  policy, cluster policies — serverless removes these knobs. PAVE treats compute mode as a
+  first-class choice: pick **Serverless** (the default) and those knobs disappear; only Classic
+  targets show them. The vending surface is deliberately shrinking with the platform, not
+  clinging to legacy machine config.
+- **The hard parts are untouched by serverless.** *Who* may create a resource and who approved
+  it (SoD, risk-tiered routing); is it **tagged so spend is attributable** — which serverless
+  usage-based billing makes *harder*, since there's no node to tag and `system.billing.usage`
+  attribution rests entirely on tags-at-birth; who owns it, when it sunsets, and the audit
+  trail; and whether it is born compliant (classification, retention, PHI). All of this is
+  compute-agnostic, and it is exactly PAVE's lane.
+- **Serverless-native assets need governance most.** LLM gateway endpoints, Vector Search, model
+  serving, Lakebase, Apps — the growth areas — are serverless already and carry the highest
+  governance/attribution stakes.
+- **Complement, don't duplicate.** Where Databricks ships it natively (budget policies, usage
+  dashboards, tag policies), PAVE defers and deep-links; it does not re-implement it.
+
+The through-line: **serverless makes it easy to *create* resources; PAVE governs, attributes,
+and manages the lifecycle of what gets created** — a layer that gets more valuable as compute
+gets easier.
+
 ## Run locally (offline-friendly, safe)
 
 No Lakebase required — the app falls back to an in-memory demo store, and with
@@ -53,6 +99,13 @@ python3 -m uvicorn backend.main:app --host 127.0.0.1 --port 8731
 
 Use the **Acting as** persona switcher (top-right) to move between requester, platform approver,
 and security/compliance and exercise the full intake → approve → provision flow.
+
+Before committing, run the checks. They are offline, need no `pip install`, and force
+real providers off, so they can never touch a live workspace:
+
+```bash
+make check     # smoke tests + simulated/real provider parity + SPA syntax
+```
 
 ## Setup (before deploying to your workspace)
 

@@ -19,7 +19,8 @@ import logging
 import uuid
 from typing import Any
 
-from .base import Provider, ProvisionResult, new_asset_id
+from .base import Provider, ProvisionResult, classify_error, new_asset_id
+from .. import naming
 
 logger = logging.getLogger("pave.provider.workspace")
 
@@ -32,9 +33,7 @@ class WorkspaceProvider(Provider):
         cfg = resource.get("config", {})
         project_id = request.get("project_id", "proj")
         region = cfg.get("region") or request.get("region") or "us-east-1"
-        deployment_name = (cfg.get("deployment_name") or cfg.get("name")
-                           or f"{request.get('business_domain', 'proj')}-{project_id.split('-')[-1]}"
-                           ).lower().replace("_", "-")[:30]
+        deployment_name = naming.resolve_name("workspace", request, cfg)
         modeled = {
             "deployment_name": deployment_name,
             "region": region,
@@ -51,7 +50,7 @@ class WorkspaceProvider(Provider):
             "note": "account-level create runs under an account-admin SoD identity; "
                     "PAVE emits Terraform for the account team to apply",
         }
-        created = self._try_create_real(deployment_name, region, cfg)
+        created, reason = self._try_create_real(deployment_name, region, cfg)
         if created:
             mode, external_id = "real", str(created.get("workspace_id"))
             provenance = created
@@ -67,17 +66,20 @@ class WorkspaceProvider(Provider):
             provenance["bootstrap"] = {"status": "deferred", "error": str(e)[:200]}
 
         return ProvisionResult(
-            asset_id=new_asset_id("workspace", project_id),
+            asset_id=new_asset_id("workspace", project_id, context),
             type="workspace",
             names={"name": deployment_name, **{k: str(v) for k, v in modeled.items()}},
             external_id=external_id,
             applied_tags=tag_set,
             mode=mode,
+            mode_reason=reason,
+            degraded=mode != "real" and reason != "configured_simulated",
             status="ACTIVE",
             provenance={"workspace": modeled, **provenance},
         )
 
-    def _try_create_real(self, deployment_name: str, region: str, cfg: dict) -> dict | None:
+    def _try_create_real(self, deployment_name: str, region: str,
+                         cfg: dict) -> tuple[dict | None, str]:
         """Real create via the Account API — only when ALLOW_REAL + account-admin auth.
 
         Two modes (compute_mode config, default 'serverless'):
@@ -87,11 +89,12 @@ class WorkspaceProvider(Provider):
           * CLASSIC/HYBRID — customer-managed; requires a pre-provisioned credentials_id +
             storage_configuration_id (account-admin registers these). Modeled if absent.
 
-        Returns the created workspace dict, or None to fall back to modeled.
+        Returns (created, reason); a None create always carries why, so the modelled
+        asset states it instead of presenting as an unqualified ACTIVE.
         """
         from .. import config
         if not config.ALLOW_REAL:
-            return None
+            return None, "kill_switch_off"
         compute_mode = (cfg.get("compute_mode") or "serverless").lower()
         cred, stor = cfg.get("credentials_id"), cfg.get("storage_config_id")
         try:
@@ -103,8 +106,8 @@ class WorkspaceProvider(Provider):
                 kwargs["compute_mode"] = CustomerFacingComputeMode.SERVERLESS
             else:
                 if not (cred and stor):
-                    logger.info("classic workspace needs credentials_id + storage_config_id; modeling")
-                    return None
+                    logger.info("classic workspace needs credentials_id + storage_config_id; modelling")
+                    return None, "missing_prerequisite"
                 kwargs.update(deployment_name=deployment_name, credentials_id=cred,
                               storage_configuration_id=stor,
                               network_id=cfg.get("network_id") or None,
@@ -123,10 +126,11 @@ class WorkspaceProvider(Provider):
                     out["metastore_id"] = ms
                 except Exception as me:  # noqa: BLE001
                     out["metastore_assign_error"] = str(me)[:200]
-            return out
+            return out, "real"
         except Exception as e:  # noqa: BLE001 — no account access in this env => model
-            logger.warning("real workspace create failed (%s); modeling instead", e)
-            return None
+            reason = classify_error(e)
+            logger.warning("real workspace create failed (%s: %s); modelling instead", reason, e)
+            return None, reason
 
     def _bootstrap(self, created: dict | None) -> dict:
         """Day-0 setup for a newly vended workspace so it is born usable + governed.

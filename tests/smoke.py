@@ -33,9 +33,12 @@ def check(name, cond):
 
 def _req(**over):
     base = dict(
-        project_name="Test Project", description="A sufficiently long description here for validation.",
+        use_case_name="Test Use Case", project_name="Test Project",
+        description="A sufficiently long description here for validation.",
         justification="A sufficiently long business justification for the audit trail and gates.",
-        owner_group="platform", cost_center="CC-1001", business_domain="platform",
+        business_owner="owner@x.com", business_function="data_platform",
+        business_sub_function="data_engineering",
+        owner_group="dbx-platform-dev-eng", cost_center="CC-1001", business_domain="platform",
         data_classification=DataClassification.internal, environment=Environment.dev,
         sunset_date="2026-12-31", acknowledgements=["cost-ownership", "data-handling"],
         resources=[ResourceRequest(type="schema", config={})],
@@ -227,6 +230,161 @@ async def _cluster_policy():
     check("cluster: company policy_id attached/modeled", bool(a["names"].get("policy_id")))
 
 
+async def _gates_and_signatures():
+    """The approval spine: gates are enforced per entitlement, you cannot sign your own
+    request, and each signature is bound to a digest of the record it approved."""
+    from backend.auth import CurrentUser
+    from backend.routers.approvals import decide, queue
+    from backend.routers.requests import request_signatures
+    from backend.models import ApprovalIn
+
+    rec = await db.create_request({
+        "project_id": "proj-gate", "project_name": "Gate", "requester": "lead@x.com",
+        "owner_email": "lead@x.com", "owner_group": "dbx-clinical-prod-eng",
+        "cost_center": "CC-2034", "business_domain": "clinical",
+        "data_classification": "restricted", "environment": "prod",
+        "status": "PENDING_APPROVAL", "risk_tier": "TIER2",
+        "resources": [{"type": "schema", "config": {}}],
+        "metadata": {"routing": {"gates": ["platform", "security-compliance", "gxp-validation"]}}})
+    rid = str(rec["id"])
+    requester = CurrentUser(email="lead@x.com", groups=["pave-approvers"],
+                            is_approver=True, is_admin=False)
+    platform = CurrentUser(email="plat@x.com", groups=["pave-approvers"],
+                           is_approver=True, is_admin=False)
+    compliance = CurrentUser(email="qa@x.com", groups=["platform-admins", "qa-validation"],
+                             is_approver=True, is_admin=True)
+
+    try:
+        await decide(rid, ApprovalIn(decision="approve", esignature="Lead"), requester)
+        check("gates: self-approval blocked", False)
+    except Exception as e:  # noqa: BLE001
+        check("gates: self-approval blocked", "raised this request" in str(e))
+
+    r1 = await decide(rid, ApprovalIn(decision="approve", esignature="Plat"), platform)
+    check("gates: platform signature does not finish a TIER2 request",
+          r1["status"] == "PENDING_APPROVAL" and r1["signed_gate"] == "platform")
+
+    try:
+        await decide(rid, ApprovalIn(decision="approve", esignature="Plat",
+                                     gate="gxp-validation"), platform)
+        check("gates: unentitled gate refused", False)
+    except Exception as e:  # noqa: BLE001
+        check("gates: unentitled gate refused", "not entitled" in str(e))
+
+    q = await queue(compliance)
+    mine = next((x for x in q if str(x["id"]) == rid), None)
+    check("gates: queue shows what this approver may sign",
+          bool(mine) and "gxp-validation" in mine["signable_gates"])
+
+    await decide(rid, ApprovalIn(decision="approve", esignature="QA",
+                                 gate="security-compliance"), compliance)
+    last = await decide(rid, ApprovalIn(decision="approve", esignature="QA",
+                                        gate="gxp-validation"), compliance)
+    check("gates: request advances only once every gate is signed",
+          last["status"] == "APPROVED")
+
+    sigs = await request_signatures(rid, compliance)
+    check("part11: every signature verifies against the record it signed",
+          len(sigs["signatures"]) == 3
+          and all(s["verification"]["matches"] for s in sigs["signatures"]))
+
+
+async def _fast_lane_and_retry():
+    """Tier-0 auto-approves against a named policy, and a failed request can be re-driven
+    without duplicating the assets that already succeeded."""
+    from backend.auth import CurrentUser
+    from backend.routers.requests import create_request
+    from backend.services.provisioning_service import retry_request
+
+    user = CurrentUser(email="lead@x.com", groups=["engineers"],
+                       is_approver=False, is_admin=False)
+    out = await create_request(_req(project_name="Fast Lane"), user)
+    check("fast-lane: Tier-0 standard change auto-approves", bool(out.get("auto_approved")))
+    check("fast-lane: the authorizing policy is named in the response",
+          bool((out.get("policy") or {}).get("id")))
+
+    rid = str(out["request"]["id"])
+    for _ in range(20):
+        rec = await db.get_request(rid)
+        if rec["status"] in ("ACTIVE", "PARTIAL", "FAILED"):
+            break
+        await asyncio.sleep(0.05)
+    check("fast-lane: provisioning runs without a human gate", rec["status"] == "ACTIVE")
+
+    try:
+        await retry_request(rid, actor="smoke")
+        check("retry: refuses a healthy request", False)
+    except ValueError as e:
+        check("retry: refuses a healthy request", "FAILED or PARTIAL" in str(e))
+
+    # A half-provisioned request: two resources, only the first one built. The retry must
+    # finish the second without re-creating (or duplicating) the first.
+    partial = await db.create_request({
+        "project_id": "proj-partial", "project_name": "Partial", "requester": "lead@x.com",
+        "owner_email": "lead@x.com", "owner_group": "dbx-platform-dev-eng",
+        "cost_center": "CC-1001", "business_domain": "platform",
+        "data_classification": "internal", "environment": "dev",
+        "status": "PARTIAL", "risk_tier": "TIER0",
+        "resources": [{"type": "schema", "config": {}}, {"type": "cluster", "config": {}}]})
+    prid = str(partial["id"])
+    from backend.providers.base import new_asset_id
+    await db.add_asset({
+        "asset_id": new_asset_id("schema", "proj-partial",
+                                 {"request_id": prid, "resource_index": 0}),
+        "request_id": prid, "type": "schema", "names": {"name": "already-there"},
+        "external_id": "already-there", "owner_id": "own-1", "project_id": "proj-partial",
+        "mode": "simulated", "status": "ACTIVE", "applied_tags": {}})
+    out2 = await retry_request(prid, actor="smoke")
+    assets = await db.list_assets(request_id=prid)
+    check("retry: only the unprovisioned resource is re-driven",
+          [c["type"] for c in out2["created"]] == ["cluster"])
+    check("retry: the asset that already existed is not duplicated",
+          sorted(a["type"] for a in assets) == ["cluster", "schema"])
+    check("retry: a fully provisioned request lands ACTIVE",
+          (await db.get_request(prid))["status"] == "ACTIVE")
+
+
+async def _reconcile_and_access():
+    """The reconcile loop finds injected drift, and access grants are risk-tiered."""
+    from backend.auth import CurrentUser
+    from backend.routers.access import request_access, AccessRequestIn
+    from backend.routers.governance import reconcile, simulate_drift, clear_simulated_drift
+
+    admin = CurrentUser(email="qa@x.com", groups=["platform-admins"],
+                        is_approver=True, is_admin=True)
+    rec = await db.create_request({
+        "project_id": "proj-rec", "project_name": "Rec", "requester": "x@x.com",
+        "owner_email": "x@x.com", "owner_group": "dbx-platform-dev-eng",
+        "cost_center": "CC-1001", "business_domain": "platform",
+        "data_classification": "internal", "environment": "dev",
+        "status": "APPROVED", "risk_tier": "TIER0",
+        "resources": [{"type": "schema", "config": {}}]})
+    rid = str(rec["id"])
+    await provision_request(rid, actor="smoke")
+    asset = (await db.list_assets(request_id=rid))[0]
+
+    clean = await reconcile(admin)
+    check("reconcile: a freshly vended asset is in sync", clean["findings"] == 0)
+
+    await simulate_drift(asset["asset_id"], untag="cost_center", user=admin)
+    drifted = await reconcile(admin)
+    check("reconcile: stripped tag is reported as drift",
+          any(d["asset_id"] == asset["asset_id"] for d in drifted["drifted"]))
+    await clear_simulated_drift(admin)
+
+    g = await request_access(AccessRequestIn(
+        asset_id=asset["asset_id"], principal="dbx-platform-dev-read", level="read"), admin)
+    check("access: read on internal data is pre-authorized", g["approval"] == "auto")
+    check("access: the grant is modelled honestly, with a reason",
+          g["applied"]["mode"] == "simulated" and bool(g["applied"]["mode_reason"]))
+    try:
+        await request_access(AccessRequestIn(
+            asset_id=asset["asset_id"], principal="p", level="owner"), admin)
+        check("access: ownership transfer is not grantable", False)
+    except Exception as e:  # noqa: BLE001
+        check("access: ownership transfer is not grantable", "not a grantable level" in str(e))
+
+
 def main():
     print("PAVE smoke test (demo mode, real providers disabled)\n")
     print("routing:");    test_routing()
@@ -239,6 +397,9 @@ def main():
     print("deps:");       asyncio.run(_dependency_guard())
     print("ai-flow:");    asyncio.run(_ai_flow())
     print("cluster:");    asyncio.run(_cluster_policy())
+    print("gates:");      asyncio.run(_gates_and_signatures())
+    print("fast-lane:");  asyncio.run(_fast_lane_and_retry())
+    print("day-2:");      asyncio.run(_reconcile_and_access())
     print()
     if _fails:
         print(f"FAILED ({len(_fails)}): {_fails}")

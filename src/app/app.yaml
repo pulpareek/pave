@@ -11,9 +11,13 @@ env:
   - name: "PGAPPNAME"
     value: "pave"
   # Demo persona switcher (X-Pave-Persona) for requester/approver/compliance roles.
-  # Set to "0" in a hardened deploy so role derives only from real identity/groups.
+  # Any caller can pick their own persona, so this is a demo affordance, NOT access
+  # control. ENVIRONMENT=production disables it outright regardless of this value.
   - name: "DEMO_PERSONAS"
     value: "1"
+  # demo | production. Keep "demo" while the persona switcher is in use; the two were
+  # previously contradictory (personas on, environment production), which let any
+  # workspace user satisfy a compliance gate.
   - name: "ENVIRONMENT"
     value: "production"
   - name: "LOG_LEVEL"
@@ -64,8 +68,12 @@ env:
     valueFrom: "sql-warehouse"
 
   # ---- Provisioning engine ----
-  # inprocess = run the engine inside the backend (robust demo default)
-  # job       = trigger the serverless provisioning Job (SoD-hardened path)
+  # inprocess = run the engine inside the backend as the APP service principal. Simple,
+  #             but the app SP both submits and creates, so there is no SoD.
+  # job       = trigger the serverless provisioning Job, which runs as the provisioner
+  #             identity. This is the SoD-hardened path and the one the docs describe.
+  # In job mode a failed trigger does NOT silently fall back to in-process (that would
+  # defeat SoD exactly when it matters); the request is parked as FAILED instead.
   - name: "PROVISION_MODE"
     value: "inprocess"
 
@@ -75,12 +83,22 @@ env:
 
   # Per-resource real|simulated mechanism overrides (JSON). Empty = use defaults
   # in backend/providers/registry.py (schema real; AI real-capable; cluster/lakebase sim).
+  #
+  # RECOMMENDED DEMO RECIPE — one genuinely real, verifiable resource next to clearly
+  # labelled simulated ones. UC schema creation is cheap, reversible, and provable in
+  # Unity Catalog after the demo; everything that costs money stays modelled:
+  #   {"schema":"real","catalog":"simulated","cluster":"simulated","job_cluster":"simulated",
+  #    "lakebase":"simulated","app":"simulated","workspace":"simulated",
+  #    "llm_gateway_endpoint":"simulated","vector_search":"simulated","sql_warehouse":"simulated"}
+  # Pair it with PAVE_ALLOW_REAL=1. Requires PARENT_CATALOG set to a catalog you own.
   - name: "PROVIDER_MODES"
     value: ""
 
   # ---- Safety kill-switch ----
   # Real providers only run when this is 1/true. Default OFF so a deploy never mutates the
-  # workspace until you opt in (everything degrades to simulated). Set to "1" to enable.
+  # workspace until you opt in (everything degrades to simulated, and now says so in the UI
+  # rather than reporting a green ACTIVE for something that was never created).
+  # Set to "1" together with a scoped PROVIDER_MODES above.
   - name: "PAVE_ALLOW_REAL"
     value: "0"
 
@@ -121,8 +139,21 @@ env:
   - name: "METASTORE_ID"
     value: ""
 
+  # ---- Account-level provisioning (multi-workspace routing + NEW-workspace vending) ----
+  # ONLY needed to create new workspaces or provision assets INTO other workspaces. Requires
+  # an account service principal (account-admin) with OAuth M2M creds in a secret scope. Leave
+  # blank/commented for a single-workspace deployment (the default; everything else degrades
+  # to simulated). FULL what-to-create + where-to-wire checklist: docs/ADMIN_CAPABILITIES.md §9.
+  # - name: "DATABRICKS_ACCOUNT_ID"
+  #   value: ""
+  # - name: "PAVE_PROVISIONER_CLIENT_ID"
+  #   value: ""
+  # - name: "PAVE_PROVISIONER_SECRET"        # bind a secret scope; never a literal here
+  #   valueFrom: "provisioner-secret"
+
   # ---- Intake co-pilot ----
   # Foundation Model serving endpoint the NL intake co-pilot calls (heuristic fallback if
-  # unavailable). Default databricks-claude-sonnet-4; set to a model available in your workspace.
+  # unavailable). Set to a CURRENT chat endpoint in your workspace — model names churn and
+  # deprecated ones (e.g. databricks-claude-sonnet-4) return BAD_REQUEST -> heuristic fallback.
   - name: "LLM_ENDPOINT"
-    value: "databricks-claude-sonnet-4"
+    value: "databricks-claude-opus-4-8"

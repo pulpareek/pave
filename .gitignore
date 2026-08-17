@@ -21,6 +21,7 @@ databricks.local.yml
 CLAUDE.md
 CLAUDE.local.md
 .claude/
+.isaac/
 
 # Internal-only docs — never publish (see docs/PUBLIC_EXPORT.md for the rationale)
 docs/PUBLIC_EXPORT.md
@@ -34,6 +35,10 @@ docs/*.pdf
 .env.*
 !.env.example
 env.local
+
+# Unrelated scaffold that landed in this tree by accident. It is not part of PAVE and it
+# carries workspace-specific values, so it must never reach the public remote.
+healthcare_unified_agent/
 
 scratch/**
 !scratch/README.md

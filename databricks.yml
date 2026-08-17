@@ -76,6 +76,14 @@ variables:
     description: OAuth client_id of the deployed app SP (find via `databricks apps get pave` after first deploy)
     default: ""
 
+  # ---- Notifications ----
+  # Recipient for provisioning-job email notifications (start/success/failure). Databricks'
+  # OWN control-plane mailer sends these — no SMTP relay/credentials needed. Real value lives
+  # in the gitignored databricks.local.yml; leave "" in the public file (a deployer sets it).
+  notification_email:
+    description: Email address Databricks notifies on provisioning job start/success/failure
+    default: ""
+
 targets:
   dev:
     mode: development
@@ -107,6 +115,26 @@ targets:
       trigger_pause_status: UNPAUSED
     variables:
       # SETUP: set your production catalog(s).
+      catalog: ""
+      schema: pave
+      parent_catalog: ""
+    permissions:
+      - user_name: ${workspace.current_user.userName}
+        level: CAN_MANAGE
+
+  # Classic-cluster-capable workspace, for verifying the real cluster->RUNNING + real
+  # schema paths that a serverless-only workspace can't prove. Real host + catalog +
+  # warehouse + lakebase live in the gitignored databricks.local.yml.
+  classic:
+    mode: development
+    workspace:
+      # SETUP: a workspace that supports classic all-purpose clusters.
+      host: https://<your-workspace-host>
+    presets:
+      name_prefix: ""
+      trigger_pause_status: PAUSED
+      jobs_max_concurrent_runs: 1
+    variables:
       catalog: ""
       schema: pave
       parent_catalog: ""

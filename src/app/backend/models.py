@@ -27,6 +27,12 @@ class Environment(str, Enum):
     prod = "prod"
 
 
+# Medallion layer — the middle token of the field-proven catalog convention
+# `{domain}_{layer}_{env}` (e.g. clinical_gold_prod). Optional: when absent the
+# catalog name collapses to `{domain}_{env}` (the OMOP `omop_prod` flavor).
+MEDALLION_LAYERS = ["raw", "bronze", "silver", "gold"]
+
+
 class ResourceType(str, Enum):
     catalog = "catalog"
     schema = "schema"
@@ -36,6 +42,7 @@ class ResourceType(str, Enum):
     lakebase = "lakebase"
     llm_gateway_endpoint = "llm_gateway_endpoint"   # governed LLM serving endpoint (AI Gateway)
     vector_search = "vector_search"                 # vector search endpoint (+ index)
+    sql_warehouse = "sql_warehouse"                 # governed SQL warehouse (serverless default)
     workspace = "workspace"                         # account-level landing zone (Account API / Terraform substrate)
 
 
@@ -146,8 +153,11 @@ SECURITY_REVIEW_STATUSES = ["not-started", "in-review", "approved", "exempt"]
 # Platform-approved models. Databricks-hosted FMs need no external key; external
 # providers require a secret (AI_GATEWAY_SECRET_*). Editing this list = the allow-list.
 ALLOWED_AI_MODELS = {
-    "databricks": ["databricks-claude-sonnet-4", "databricks-meta-llama-3-3-70b-instruct",
-                   "databricks-gte-large-en"],
+    # Databricks-hosted foundation models registered in system.ai (the ones a UC AI-Gateway
+    # model service can route to pay-per-token). Kept current — the older llama entry was
+    # deprecated and is no longer a registered model.
+    "databricks": ["databricks-claude-opus-4-8", "databricks-claude-sonnet-4",
+                   "databricks-claude-opus-5", "databricks-gpt-5-5", "databricks-gte-large-en"],
     "openai": ["gpt-4o", "gpt-4o-mini"],
     "anthropic": ["claude-3-5-sonnet"],
 }
@@ -180,6 +190,10 @@ PG_VERSIONS = ["16", "17"]
 
 # AI Gateway / serving
 LLM_THROUGHPUT_MODES = ["pay_per_token", "provisioned"]
+
+# SQL Warehouse (serverless is the governed default; larger sizes capped out of the vocab)
+WAREHOUSE_SIZES = ["2X-Small", "X-Small", "Small", "Medium", "Large"]
+WAREHOUSE_TYPES = ["serverless", "pro", "classic"]   # serverless -> PRO + serverless compute
 
 # Vector Search
 VS_INDEX_TYPES = ["DELTA_SYNC", "DIRECT_ACCESS"]
@@ -234,6 +248,7 @@ class RequestIn(BaseModel):
     business_domain: str
     data_classification: DataClassification
     environment: Environment
+    medallion_layer: Optional[str] = None   # raw|bronze|silver|gold — drives catalog naming
     region: Optional[str] = None
     parent_catalog: Optional[str] = None
     # Target workspace to provision INTO (host, e.g. https://ws.cloud.databricks.com).
@@ -319,10 +334,26 @@ class RequestOut(BaseModel):
     updated_at: Optional[Any] = None
 
 
+# 21 CFR Part 11 §11.50 requires a signature manifestation to carry the signer's printed
+# name, the date and time of signing, and the MEANING of the signature. §11.70 requires it
+# to be linked to its record so it cannot be transferred to another one. PAVE satisfies the
+# link by signing a digest of the request's canonical desired-state spec.
+SIGNATURE_MEANINGS = {
+    "approved": "I approve this request and authorize provisioning of the resources it describes.",
+    "reviewed": "I have reviewed this request for compliance with the stated controls.",
+    "rejected": "I reject this request; it must not be provisioned as described.",
+}
+
+
 class ApprovalIn(BaseModel):
     decision: str                       # "approve" | "reject"
     reason: str = ""
-    esignature: str                     # typed full name = 21 CFR Part 11-style e-sign
+    esignature: str                     # typed full name (the signer's printed name)
+    # Which approval gate this signature is for. Empty = the first outstanding gate the
+    # signer is entitled to sign.
+    gate: str = ""
+    # Meaning of the signature (Part 11 §11.50). Defaults from the decision.
+    meaning: str = ""
 
 
 class ReassignIn(BaseModel):

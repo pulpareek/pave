@@ -1,0 +1,36 @@
+{
+  "use_case_name": "Site Monitoring Extract Sandbox",
+  "project_name": "site-monitoring-extract",
+  "description": "Expired test sandbox holding a PHI site-monitoring extract from the closed ONC-198 study.",
+  "justification": "Retained past its sunset date pending the study close-out retention review, which is exactly why it must not be auto-deleted by the sunset sweep.",
+  "owner_group": "dbx-clinical-test-rw",
+  "business_owner": "maya.chandra@lifesci.example",
+  "business_domain": "clinical",
+  "business_function": "clinical_operations",
+  "business_sub_function": "site_management",
+  "department": "clinical-dev",
+  "data_classification": "restricted",
+  "environment": "test",
+  "sunset_date": "2026-05-31",
+  "data_retention": "gxp-retention",
+  "compliance_scope": [
+    "gxp",
+    "hipaa"
+  ],
+  "gxp_relevant": true,
+  "contains_phi": true,
+  "validated_system": true,
+  "cost_center": "CC-2034",
+  "budget_monthly_cap": 200,
+  "resources": [
+    {
+      "type": "schema",
+      "config": {}
+    }
+  ],
+  "acknowledgements": [
+    "cost-ownership",
+    "data-handling",
+    "phi-handling"
+  ]
+}

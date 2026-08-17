@@ -9,8 +9,10 @@ To enable real email, set SMTP_HOST/PORT/USER/PASSWORD/FROM (see env.example) an
 (so the deep-link is absolute). Everything here is best-effort: a notification failure must
 NEVER break request creation — callers fire-and-forget.
 """
+import json
 import logging
 import smtplib
+import urllib.request
 from email.mime.text import MIMEText
 
 from .. import config
@@ -59,6 +61,45 @@ def _send_smtp(to_addrs: list[str], subject: str, body: str) -> None:
         if config.SMTP_USER:
             s.login(config.SMTP_USER, config.SMTP_PASSWORD)
         s.sendmail(config.SMTP_FROM, to_addrs, msg.as_string())
+
+
+def _slack_blocks(request: dict, link: str) -> dict:
+    """Block Kit payload for the approval ping. A link button is only added when APP_URL
+    yields an absolute URL (Slack rejects relative button URLs)."""
+    pid = request.get("project_id") or request.get("id")
+    tier = request.get("risk_tier") or "?"
+    name = request.get("project_name") or request.get("use_case_name") or "(unnamed)"
+    requester = request.get("requester") or "unknown"
+    resources = ", ".join(sorted({(r.get("type") or "") for r in (request.get("resources") or [])})) or "—"
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": f"PAVE — approval needed: {name}"}},
+        {"type": "section", "fields": [
+            {"type": "mrkdwn", "text": f"*Project:*\n{pid}"},
+            {"type": "mrkdwn", "text": f"*Risk tier:*\n{tier}"},
+            {"type": "mrkdwn", "text": f"*Requester:*\n{requester}"},
+            {"type": "mrkdwn", "text": f"*Resources:*\n{resources}"},
+        ]},
+    ]
+    if link.startswith("http"):
+        blocks.append({"type": "actions", "elements": [
+            {"type": "button", "text": {"type": "plain_text", "text": "Review in PAVE"},
+             "url": link, "style": "primary"}]})
+    else:
+        blocks.append({"type": "context", "elements": [
+            {"type": "mrkdwn", "text": f"Open PAVE → Approvals ({link})"}]})
+    return {"text": f"PAVE approval needed: {name} ({tier}) — {pid}", "blocks": blocks}
+
+
+def _send_slack(request: dict, link: str) -> None:
+    """POST the approval message to the Slack Incoming Webhook (sync; wrap in a thread).
+    Raises on non-200 so the caller records the failure."""
+    payload = json.dumps(_slack_blocks(request, link)).encode()
+    req = urllib.request.Request(config.SLACK_WEBHOOK_URL, data=payload,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        resp = r.read().decode()
+        if resp != "ok":
+            raise RuntimeError(f"slack webhook returned {r.status}: {resp[:200]}")
 
 
 async def notify_approvers(request: dict, approvers: list[str]) -> dict:

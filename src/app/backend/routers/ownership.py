@@ -47,9 +47,15 @@ async def reassign(payload: ReassignIn, user: CurrentUser = Depends(get_current_
         merged = {**(a.get("applied_tags") or {}), **new_tags}
         await db.update_asset(a["asset_id"], applied_tags=merged)
         retagged.append(a["asset_id"])
+        # Follow the reassignment onto the LIVE securable for real UC assets (best-effort;
+        # so ownership/cost-center tags on the actual resource track the new owner, not just
+        # PAVE's registry). Compute/cross-workspace degrade to registry-only, recorded.
+        import asyncio
+        from ..providers._sdk import push_live_tags
+        live = await asyncio.to_thread(push_live_tags, a, merged, (req or {}).get("target_workspace"))
         await db.add_audit(actor=user.email, event_type="ownership.reassigned",
                            asset_id=a["asset_id"], request_id=str(a.get("request_id") or "") or None,
                            payload={"new_owner": new_oid, "old_owner": old_oid,
-                                    "esignature": payload.esignature})
+                                    "esignature": payload.esignature, "live": live})
 
     return {"new_owner": new_oid, "reassigned_assets": retagged, "count": len(retagged)}

@@ -8,7 +8,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .exceptions import PaveError
-from .routers import approvals, assist, finops, governance, meta, ownership, registry, requests
+from .routers import (
+    access, approvals, assist, finops, governance, meta, ownership, registry, requests)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -54,6 +55,7 @@ app.include_router(approvals.router)
 app.include_router(registry.router)
 app.include_router(ownership.router)
 app.include_router(governance.router)
+app.include_router(access.router)
 app.include_router(finops.router)
 
 
@@ -74,8 +76,31 @@ async def startup():
 # ---- health ----
 @app.get("/api/health")
 async def health():
+    """Reports `degraded` when the app is running on in-memory state or cannot honour its
+    configured provisioning mode. Previously this always said healthy, so a deployment
+    silently running in demo storage looked identical to a working one."""
     from . import config
-    return {"status": "healthy", "service": "PAVE", "provision_mode": config.PROVISION_MODE}
+    from .database import db
+
+    problems = []
+    # Resolve the connection first: demo_mode is set lazily, so reading the flag without
+    # touching the pool can report persistent storage on an app that has none.
+    db_health = await db.health()
+    if db.demo_mode:
+        problems.append("operational state is in memory only (Lakebase unavailable or "
+                        "LAKEBASE_INSTANCE unset); data is lost on restart")
+    if config.PROVISION_MODE == "job" and not config.PROVISIONING_JOB_ID:
+        problems.append("PROVISION_MODE=job but PROVISIONING_JOB_ID is unset; approvals "
+                        "cannot be provisioned")
+    return {
+        "status": "degraded" if problems else "healthy",
+        "service": "PAVE",
+        "environment": config.ENVIRONMENT,
+        "provision_mode": config.PROVISION_MODE,
+        "allow_real": config.ALLOW_REAL,
+        "database": db_health,
+        "problems": problems,
+    }
 
 
 @app.get("/api/health/database")

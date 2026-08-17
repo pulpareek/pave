@@ -109,6 +109,20 @@ button.btn.small { padding: 7px 11px; font-size: 12px; }
 .pill.real { color: var(--green); border-color: var(--green); }
 .pill.simulated { color: var(--teal); border-color: var(--teal); }
 .pill.dabs { color: var(--lava-soft); border-color: var(--lava-soft); }
+.pill.degraded { color: var(--amber); border-color: var(--amber); }
+.tagset .kv.ok { color: var(--green); border-color: var(--green); }
+
+/* ---- posture banner: what this deployment actually does ---- */
+.posture { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  background: rgba(224,168,0,.07); border-bottom: 1px solid var(--amber);
+  padding: 9px 20px; font-size: 12.5px; color: var(--text); }
+.posture.soft { background: rgba(0,166,160,.06); border-bottom-color: var(--teal); }
+.posture-tag { font-weight: 700; text-transform: uppercase; letter-spacing: .6px;
+  font-size: 10px; color: var(--amber); border: 1px solid var(--amber);
+  border-radius: 999px; padding: 2px 9px; white-space: nowrap; }
+.posture.soft .posture-tag { color: var(--teal); border-color: var(--teal); }
+.posture-notes { flex: 1; min-width: 240px; color: var(--muted); }
+.posture-notes b { color: var(--text); font-weight: 650; }
 .tagset { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
 .tagset .kv { font-size: 10.5px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 2px 7px; color: var(--muted); }
 a.kv { text-decoration: none; } a.kv:hover { color: var(--teal); border-color: var(--teal); }
@@ -200,3 +214,12 @@ input.invalid, textarea.invalid, select.invalid { border-color: var(--red); box-
 .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.62); display: flex; align-items: center; justify-content: center; z-index: 100; }
 .modal { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px; width: min(780px, 92vw); max-height: 82vh; display: flex; flex-direction: column; box-shadow: var(--shadow); }
 .modal-body { margin: 12px 0 0; overflow: auto; background: var(--bg); border: 1px solid var(--line); border-radius: 9px; padding: 13px; font-size: 12px; white-space: pre; color: var(--text); }
+
+/* Registry tags: collapse the full governed tag set into a compact disclosure so it
+   doesn't blow the table row height apart; expands in place, bounded + scrollable. */
+.tags-cell > summary { cursor: pointer; color: var(--muted); font-size: 12px; list-style: none; user-select: none; }
+.tags-cell > summary::-webkit-details-marker { display: none; }
+.tags-cell > summary::before { content: "▸ "; }
+.tags-cell[open] > summary::before { content: "▾ "; }
+.tags-cell[open] > summary { margin-bottom: 6px; }
+.tags-cell[open] .tagset { max-height: 220px; overflow: auto; }

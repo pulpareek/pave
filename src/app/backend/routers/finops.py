@@ -22,6 +22,8 @@ RATE_CARD = {
     "schema": 5, "catalog": 5, "app": 80, "cluster": 400,
     "job_cluster": 150, "lakebase": 120,
     "llm_gateway_endpoint": 600, "vector_search": 250,
+    "sql_warehouse": 200,
+    "budget_alert": 0,   # a governed cost control, not a billable resource
 }
 
 # ROI assumptions for the days->minutes story (tune for the customer).
@@ -30,8 +32,41 @@ ENGINEER_DAY_COST = 900             # fully-loaded $/engineer-day
 PAVE_MINUTES = 4                    # typical PAVE time-to-first-resource
 
 
+# Rough size multipliers so the estimate reflects the chosen footprint (still a rate-card
+# stand-in for system.billing.usage, but no longer flat-per-type). Keys match the option
+# vocabularies each resource emits in its config; matched case-insensitively.
+_SIZE_FACTORS = {
+    "2x-small": 0.5, "x-small": 0.7, "small": 1.0, "medium": 1.6, "large": 2.5,
+    "x-large": 4.0, "2x-large": 6.0, "3x-large": 8.0, "4x-large": 10.0, "xlarge": 4.0,
+    "cu_1": 1.0, "cu_2": 2.0, "cu_4": 4.0, "cu_8": 8.0,
+    "standard": 1.0, "storage_optimized": 0.4,
+}
+
+
+def _size_factor(cfg: dict) -> float:
+    for key in ("warehouse_size", "size", "compute_size", "capacity", "endpoint_type"):
+        v = cfg.get(key)
+        if v is None:
+            continue
+        f = _SIZE_FACTORS.get(str(v).strip().lower())
+        if f:
+            return f
+    return 1.0
+
+
 def _est_cost(asset: dict) -> float:
-    return float(RATE_CARD.get(asset.get("type"), 10))
+    base = float(RATE_CARD.get(asset.get("type"), 10))
+    return round(base * _size_factor(asset.get("config") or {}), 2)
+
+
+def _recommend_budget(monthly: float) -> float:
+    """A realistic monthly cap = estimate + headroom, rounded to a friendly step."""
+    if monthly <= 0:
+        return 0.0
+    import math
+    padded = monthly * 1.25
+    step = 50 if padded < 500 else (100 if padded < 2000 else 500)
+    return float(int(math.ceil(padded / step) * step))
 
 
 class EstimateIn(BaseModel):
@@ -62,10 +97,102 @@ async def summary():
         "total_estimated_monthly": round(sum(by_cc.values()), 2),
         "active_assets": len(active),
         "tag_coverage_pct": coverage_pct,
+        # This number is measured over PAVE's OWN assets, which are tagged by construction
+        # and therefore read ~100% forever. It shows the portal is doing its job; it says
+        # nothing about the estate. The metric that matters is /api/finops/attribution,
+        # which uses TOTAL workspace spend as the denominator.
+        "tag_coverage_scope": "pave_managed_assets_only",
+        "tag_coverage_caveat": "PAVE tags every asset it vends, so this is near 100% by "
+                               "construction. See /api/finops/attribution for coverage "
+                               "measured against total workspace spend.",
+        "cost_basis": "rate_card_estimate",
         "by_cost_center": dict(by_cc),
         "by_project": dict(by_project),
         "by_business_domain": dict(by_domain),
         "untagged_cost": round(by_cc.get("(untagged)", 0.0), 2),
+    }
+
+
+# Attribution completeness over ALL spend, not just PAVE's own. This is the honest
+# version of "tag coverage": the denominator is every dollar the workspace spent, and the
+# numerator is the dollars carrying a PAVE project_id. It is the one FinOps number PAVE
+# is uniquely positioned to report, and the only one that can show improvement over time.
+_ATTRIBUTION_SQL = """
+SELECT CASE
+         WHEN u.custom_tags['project_id'] IS NOT NULL
+              AND u.custom_tags['project_id'] <> '' THEN 'attributed'
+         ELSE 'unattributed'
+       END                                   AS bucket,
+       u.sku_name                            AS sku_name,
+       u.workspace_id                        AS workspace_id,
+       SUM(u.usage_quantity * lp.pricing.effective_list.default) AS list_cost
+FROM system.billing.usage u
+JOIN system.billing.list_prices lp
+  ON u.cloud = lp.cloud AND u.sku_name = lp.sku_name
+ AND u.usage_start_time >= lp.price_start_time
+ AND (u.usage_end_time <= lp.price_end_time OR lp.price_end_time IS NULL)
+WHERE u.usage_date >= current_date() - INTERVAL {days} DAYS
+GROUP BY 1, 2, 3
+ORDER BY list_cost DESC
+LIMIT 500
+"""
+
+
+@router.get("/attribution")
+async def attribution(days: int = 30):
+    """What share of TOTAL spend carries a PAVE project_id, and where the gap is.
+
+    The gap is the point: unattributed spend is resources created outside the paved road,
+    and the top unattributed SKUs are the backlog for onboarding them.
+    """
+    import asyncio
+    from .. import config
+
+    if not config.WAREHOUSE_ID:
+        return {"source": "unavailable",
+                "reason": "no SQL warehouse configured (DATABRICKS_WAREHOUSE_ID)",
+                "note": "attribution completeness needs system.billing.usage; PAVE cannot "
+                        "estimate it from its own registry without begging the question"}
+
+    def _run():
+        from databricks.sdk import WorkspaceClient
+        w = WorkspaceClient()
+        r = w.statement_execution.execute_statement(
+            statement=_ATTRIBUTION_SQL.format(days=int(days)),
+            warehouse_id=config.WAREHOUSE_ID, wait_timeout="50s")
+        return (r.result.data_array if r.result else None) or []
+
+    try:
+        rows = await asyncio.to_thread(_run)
+    except Exception as e:  # noqa: BLE001
+        return {"source": "unavailable", "reason": str(e)[:200],
+                "note": "could not reach system.billing.usage"}
+
+    attributed = unattributed = 0.0
+    gaps: dict[tuple, float] = defaultdict(float)
+    for bucket, sku, workspace_id, cost in rows:
+        cost = float(cost or 0)
+        if bucket == "attributed":
+            attributed += cost
+        else:
+            unattributed += cost
+            gaps[(sku, workspace_id)] += cost
+
+    total = attributed + unattributed
+    top_gaps = sorted(({"sku_name": s, "workspace_id": w, "list_cost": round(c, 2)}
+                       for (s, w), c in gaps.items()),
+                      key=lambda x: x["list_cost"], reverse=True)[:15]
+    return {
+        "source": "system.billing.usage",
+        "window_days": days,
+        "total_list_cost": round(total, 2),
+        "attributed_cost": round(attributed, 2),
+        "unattributed_cost": round(unattributed, 2),
+        "attribution_completeness_pct": round(100 * attributed / total, 1) if total else 0.0,
+        "top_unattributed": top_gaps,
+        "interpretation": "spend carrying a PAVE project_id as a share of all spend; the "
+                          "unattributed remainder is the estate not yet vended through "
+                          "the paved road",
     }
 
 
@@ -81,13 +208,23 @@ async def waf_scorecard():
 
 @router.post("/estimate")
 async def estimate(payload: EstimateIn):
-    """Cost preview BEFORE submit + budget-breach flag (FinOps-shift-left)."""
-    monthly = sum(RATE_CARD.get(r.get("type"), 10) for r in payload.resources)
+    """Cost preview BEFORE submit + a recommended budget cap (FinOps shift-left).
+
+    Size-aware rate-card estimate (a stand-in for system.billing.usage), plus a
+    recommended monthly cap = estimate + headroom so requesters aren't guessing what to set.
+    """
+    per = [(r.get("type"), _est_cost(r)) for r in payload.resources]
+    monthly = round(sum(c for _, c in per), 2)
+    breakdown: dict = {}
+    for t, c in per:
+        breakdown[t] = round(breakdown.get(t, 0) + c, 2)
     return {
         "estimated_monthly": monthly,
-        "breakdown": {r.get("type"): RATE_CARD.get(r.get("type"), 10) for r in payload.resources},
+        "breakdown": breakdown,
         "budget_threshold": 2000,
         "escalates_on_cost": monthly > 2000,
+        "recommended_budget": _recommend_budget(monthly),
+        "cost_basis": "size-aware rate-card estimate (stand-in; not real billing)",
     }
 
 
@@ -178,12 +315,27 @@ async def ai_finops():
 
 @router.get("/impact")
 async def impact():
-    """Days->minutes ROI: tickets eliminated, engineer-days + $ saved, time-to-provision."""
+    """Days->minutes ROI — a MODEL, not a measurement.
+
+    Only the request count is observed; everything else multiplies it by assumptions the
+    customer should replace with their own. This is returned separately, and labelled, so
+    it is not read as measured data sitting beside the real system-table numbers — which
+    would make the real numbers look invented too.
+    """
     requests = await db.list_requests(limit=1000)
     provisioned = [r for r in requests if r.get("status") in ("ACTIVE", "PARTIAL", "DECOMMISSIONED")]
     n = len(provisioned)
     days_saved = round(n * (MANUAL_PROVISION_DAYS - PAVE_MINUTES / (60 * 8)), 1)
     return {
+        "basis": "modelled",
+        "measured": {"requests_provisioned": n},
+        "assumptions": {
+            "manual_baseline_days": MANUAL_PROVISION_DAYS,
+            "pave_minutes": PAVE_MINUTES,
+            "engineer_day_cost_usd": ENGINEER_DAY_COST,
+            "note": "house figures for the ticket-driven status quo; replace with the "
+                    "customer's own cycle time and loaded cost before quoting them",
+        },
         "tickets_eliminated": n,
         "manual_baseline_days": MANUAL_PROVISION_DAYS,
         "pave_minutes": PAVE_MINUTES,

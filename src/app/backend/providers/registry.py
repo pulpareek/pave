@@ -1,14 +1,19 @@
-"""Resolve which provider + mode handles each resource type.
+"""Resolve which provider + mode handles each resource type, and own the fallback.
 
 DEFAULT_MODES encodes the hybrid demo policy (schema/app real; rest simulated).
 PROVIDER_MODES env JSON overrides per type. Real providers are imported lazily so
-the app boots even where the SDK/credentials aren't available; if a real provider
-fails to import we fall back to simulated and note it.
+the app boots even where the SDK/credentials aren't available.
+
+Fallback to simulated happens in exactly one place — `provision()` below — and always
+records a reason code. Providers must not decide on their own to return a synthetic
+handle when a real create fails; they raise ProviderUnavailable instead, so the
+degradation is visible in the asset row, the audit log, and the UI.
 """
 import logging
-from typing import Optional
+from dataclasses import dataclass
+from typing import Any, Optional
 
-from .base import Provider
+from .base import Provider, ProviderUnavailable, ProvisionResult
 from .simulated import SimulatedProvider
 from .. import config
 
@@ -30,6 +35,7 @@ DEFAULT_MODES: dict[str, str] = {
     # AI assets — real-capable (behind ALLOW_REAL), graceful fallback to modeled.
     "llm_gateway_endpoint": "real",
     "vector_search": "real",
+    "sql_warehouse": "simulated",   # real create is cheap (serverless + auto-stop); flip to real
 }
 
 
@@ -44,12 +50,21 @@ def _real_provider(resource_type: str) -> Optional[Provider]:
         if resource_type == "schema":
             from .schema import SchemaProvider
             return SchemaProvider()
+        if resource_type == "catalog":
+            from .catalog import CatalogProvider
+            return CatalogProvider()
         if resource_type == "app":
             from .app import AppProvider
             return AppProvider()
         if resource_type == "cluster":
             from .cluster_real import RealComputeProvider
             return RealComputeProvider()
+        if resource_type == "lakebase":
+            from .lakebase import LakebaseProvider
+            return LakebaseProvider()
+        if resource_type == "sql_warehouse":
+            from .sql_warehouse import SqlWarehouseProvider
+            return SqlWarehouseProvider()
         if resource_type == "llm_gateway_endpoint":
             from .ai_gateway import AIGatewayEndpointProvider
             return AIGatewayEndpointProvider()
@@ -93,29 +108,87 @@ def _simulated_provider(resource_type: str) -> Provider:
     return SimulatedProvider(resource_type)
 
 
-def get_provider(resource_type: str, mode: Optional[str] = None) -> tuple[Provider, str]:
-    """Return (provider, effective_mode) for a resource type.
+@dataclass
+class Binding:
+    """Which provider will run, in which mode, and why."""
+    provider: Provider
+    mode: str
+    reason: str
+
+    @property
+    def degraded(self) -> bool:
+        """True when a real create was intended but will not happen."""
+        return self.mode != "real" and self.reason not in ("configured_simulated", "real")
+
+
+def bind(resource_type: str, mode: Optional[str] = None) -> Binding:
+    """Choose the provider for a resource type and record why that choice was made.
 
     Modes: real (SDK) | dabs (Python-DABs showcase, schema only) | simulated.
 
     SAFETY: real/dabs only run when config.ALLOW_REAL is set (PAVE_ALLOW_REAL=1).
     Otherwise they degrade to simulated so local/demo runs never mutate the workspace.
     """
-    mode = mode or resolve_mode(resource_type)
-    if mode in ("real", "dabs") and not config.ALLOW_REAL:
-        logger.info("PAVE_ALLOW_REAL not set -> %s forced to simulated (mode was %s)",
-                    resource_type, mode)
-        return _simulated_provider(resource_type), "simulated"
-    if mode == "dabs" and resource_type == "schema":
+    requested = mode or resolve_mode(resource_type)
+    if requested in ("real", "dabs") and not config.ALLOW_REAL:
+        logger.info("PAVE_ALLOW_REAL not set -> %s modelled instead of created (was %s)",
+                    resource_type, requested)
+        return Binding(_simulated_provider(resource_type), "simulated", "kill_switch_off")
+    if requested == "dabs" and resource_type == "schema":
         try:
             from .schema_dabs import SchemaDabsProvider
-            return SchemaDabsProvider(), "dabs"
+            return Binding(SchemaDabsProvider(), "dabs", "real")
         except Exception as e:  # noqa: BLE001
             logger.warning("Python-DABs schema provider unavailable (%s); using real SDK", e)
-            mode = "real"
-    if mode == "real":
+            requested = "real"
+    if requested == "real":
         rp = _real_provider(resource_type)
         if rp is not None:
-            return rp, "real"
-        return _simulated_provider(resource_type), "simulated"
-    return _simulated_provider(resource_type), "simulated"
+            return Binding(rp, "real", "real")
+        return Binding(_simulated_provider(resource_type), "simulated", "provider_unavailable")
+    return Binding(_simulated_provider(resource_type), "simulated", "configured_simulated")
+
+
+def get_provider(resource_type: str, mode: Optional[str] = None) -> tuple[Provider, str]:
+    """Back-compat 2-tuple accessor, used by decommission paths that only need to
+    know which provider owns an existing asset."""
+    b = bind(resource_type, mode)
+    return b.provider, b.mode
+
+
+def provision(resource_type: str, *, request: dict[str, Any], resource: dict[str, Any],
+              tag_set: dict[str, str], context: dict[str, Any]) -> ProvisionResult:
+    """Run the bound provider, degrading to a modelled result only on ProviderUnavailable.
+
+    Synchronous (providers wrap the sync SDK); the saga calls this inside a thread.
+    Any other exception is a genuine failure and propagates, so a broken provider shows
+    up as a FAILED resource rather than a silently modelled one.
+    """
+    binding = bind(resource_type)
+    try:
+        result = binding.provider.provision(request=request, resource=resource,
+                                            tag_set=tag_set, context=context)
+        mode = result.get("mode") or binding.mode
+        # A provider that self-models (AI gateway, vector search, workspace) reports its
+        # own reason; anything else inherits the binding's.
+        reason = result.get("mode_reason") or (binding.reason if mode == binding.mode
+                                               else "configured_simulated")
+        result["mode"] = mode
+        result["mode_reason"] = reason
+        result["degraded"] = bool(result.get("degraded",
+                                             mode != "real" and reason not in
+                                             ("configured_simulated", "real")))
+        return result
+    except ProviderUnavailable as e:
+        logger.warning("%s: real provisioning unavailable (%s) -> modelling instead: %s",
+                       resource_type, e.reason, e)
+        fallback = _simulated_provider(resource_type)
+        result = fallback.provision(request=request, resource=resource,
+                                    tag_set=tag_set, context=context)
+        result["mode"] = "simulated"
+        result["mode_reason"] = e.reason
+        result["degraded"] = True
+        provenance = dict(result.get("provenance") or {})
+        provenance["degraded_from_real"] = {"reason": e.reason, "detail": str(e)[:300]}
+        result["provenance"] = provenance
+        return result

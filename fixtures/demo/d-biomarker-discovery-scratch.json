@@ -1,0 +1,35 @@
+{
+  "use_case_name": "Biomarker Discovery Sandbox",
+  "project_name": "biomarker-discovery-scratch",
+  "description": "Short-lived exploration sandbox for translational biomarker signal hunting on de-identified assay extracts.",
+  "justification": "Time-boxed exploration ahead of the Q3 translational review. Deliberately given a short sunset so the footprint self-retires when the study window closes.",
+  "owner_group": "dbx-research-dev-rw",
+  "business_owner": "sofia.almeida@lifesci.example",
+  "business_domain": "research",
+  "business_function": "translational",
+  "business_sub_function": "biomarkers",
+  "department": "r&d",
+  "data_classification": "internal",
+  "environment": "dev",
+  "sunset_date": "2026-06-30",
+  "cost_center": "CC-1001",
+  "cost_type": "opex",
+  "budget_monthly_cap": 300,
+  "lifecycle_stage": "poc",
+  "resources": [
+    {
+      "type": "schema",
+      "config": {}
+    },
+    {
+      "type": "job_cluster",
+      "config": {
+        "compute_mode": "serverless"
+      }
+    }
+  ],
+  "acknowledgements": [
+    "cost-ownership",
+    "data-handling"
+  ]
+}

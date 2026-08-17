@@ -5,11 +5,13 @@ vocabularies, formats, cross-field rules, and (stubbed) authoritative sources
 (SCIM group membership, finance cost-center list). Invalid requests are blocked
 before they can reach an approver.
 """
+import logging
 import os
 
+from . import config, naming
 from .models import (
     RequestIn, DataClassification, Environment, BUSINESS_DOMAINS, BUSINESS_TAXONOMY,
-    COMPLIANCE_SCOPES,
+    COMPLIANCE_SCOPES, MEDALLION_LAYERS,
     REGIONS, COST_CENTER_RE, PROJECT_NAME_RE, USE_CASE_NAME_RE, ALLOWED_CUSTOM_TAG_KEYS,
     DEPARTMENTS, LIFECYCLE_STAGES, SLA_TIERS, COST_TYPES, SECURITY_REVIEW_STATUSES,
     DATA_RETENTION_CLASSES, WBS_RE, EMAIL_RE,
@@ -18,12 +20,15 @@ from .models import (
     CATALOG_KINDS, ISOLATION_MODES, APP_COMPUTE_SIZES, LAKEBASE_OFFERINGS,
     LAKEBASE_CAPACITIES, PG_VERSIONS, LLM_THROUGHPUT_MODES,
     VS_INDEX_TYPES, VS_EMBEDDING_SOURCES, VS_PIPELINE_TYPES,
+    WAREHOUSE_SIZES, WAREHOUSE_TYPES,
 )
 
 # Stubbed authoritative sources (replace with SCIM / finance API in production).
 # Comma-separated overrides via env keep the demo flexible.
 KNOWN_COST_CENTERS = {c.strip() for c in os.getenv(
     "KNOWN_COST_CENTERS", "CC-1001,CC-1002,CC-2034,CC-4500,CC-9100").split(",") if c.strip()}
+
+logger = logging.getLogger("pave.validation")
 
 
 def _member_of(requester: str, group: str) -> bool:
@@ -36,8 +41,14 @@ def _member_of(requester: str, group: str) -> bool:
     return requester in members.get(group, [])
 
 
-def validate_request(payload: RequestIn, requester: str) -> list[str]:
-    """Return a list of human-readable validation errors (empty == valid)."""
+def validate_request(payload: RequestIn, requester: str,
+                     owner_group_resolvable: bool = False) -> list[str]:
+    """Return a list of human-readable validation errors (empty == valid).
+
+    owner_group_resolvable: True when owner_group is an EXISTING Databricks group (resolved
+    by the router via SCIM). Existing groups are accepted as-is; only a NEW group (to be
+    created) must satisfy the naming convention.
+    """
     errors: list[str] = []
 
     if not PROJECT_NAME_RE.match(payload.project_name or ""):
@@ -89,8 +100,27 @@ def validate_request(payload: RequestIn, requester: str) -> list[str]:
     if payload.region and payload.region not in REGIONS:
         errors.append(f"region must be one of {REGIONS}")
 
+    # Medallion layer: vocab check, and required when a catalog is requested and the active
+    # catalog template embeds {layer} (so `{domain}_{layer}_{env}` can't lose its middle token).
+    if payload.medallion_layer and payload.medallion_layer not in MEDALLION_LAYERS:
+        errors.append(f"medallion_layer must be one of {MEDALLION_LAYERS}")
+    wants_catalog = any(r.type.value == "catalog" for r in payload.resources)
+    if (wants_catalog and not payload.medallion_layer
+            and "{layer}" in naming.convention_hint("catalog")):
+        errors.append("medallion_layer is required when creating a catalog "
+                      f"(one of {MEDALLION_LAYERS}) — it is part of the catalog naming convention")
+
+    # Per-resource NAME convention: only user-supplied overrides are checked (a blank name is
+    # auto-generated compliant). Errors carry a suggested compliant name.
+    _naming_errors(errors, _resource_name_errors(payload))
+
     if not _member_of(requester, payload.owner_group):
         errors.append(f"requester {requester} is not a member of owning group {payload.owner_group}")
+    # The owning group must be a REAL Databricks group (the grant principal). An existing
+    # group is accepted as-is (real groups need not follow our convention); only a NEW group
+    # (one PAVE will create) must satisfy the naming convention.
+    if not owner_group_resolvable:
+        _naming_errors(errors, naming.validate_owner_group(payload.owner_group))
 
     # Custom tag keys must be in the governed vocabulary (no free-form keys).
     for k in payload.custom_tags:
@@ -202,7 +232,81 @@ def validate_request(payload: RequestIn, requester: str) -> list[str]:
     # Per-resource governed-option membership checks (block hand-crafted payloads that
     # inject values outside the allow-lists; hard cost limits stay policy-side).
     errors.extend(_validate_resource_options(payload.resources))
+    errors.extend(_validate_placement(payload))
     return errors
+
+
+def _validate_placement(payload: RequestIn) -> list[str]:
+    """Check where a request wants to land: the target workspace and any storage root.
+
+    Both were previously only used to populate the UI pickers, so a hand-built request
+    body could name any host (which then receives service-principal credentials) or any
+    storage location.
+    """
+    errs: list[str] = []
+    target = (getattr(payload, "target_workspace", "") or "").strip()
+    if target:
+        allowed = config.target_workspaces()
+        if not allowed:
+            errs.append("target_workspace was supplied but no target workspaces are "
+                        "approved (set PAVE_TARGET_WORKSPACES)")
+        elif target not in allowed:
+            errs.append(f"target_workspace '{target}' is not an approved target "
+                        f"(allowed: {allowed})")
+
+    approved_locations = config.external_locations()
+    for r in payload.resources:
+        root = ((r.config or {}).get("storage_root") or "").strip()
+        if not root:
+            continue
+        if "://" in root:
+            errs.append(f"{r.type.value}: storage_root must be a pre-approved external "
+                        f"location NAME, not a raw URI ('{root}')")
+        elif root not in approved_locations:
+            errs.append(f"{r.type.value}: storage_root '{root}' is not a pre-approved "
+                        f"external location (allowed: {approved_locations or 'none configured'})")
+    return errs
+
+
+def _naming_errors(errors: list[str], found: list[str]) -> None:
+    """Route naming/convention findings by PAVE_NAME_ENFORCE: block (append, default)
+    or warn (log only, don't block)."""
+    if not found:
+        return
+    if naming.enforce_mode() == "warn":
+        for f in found:
+            logger.warning("naming (warn, not enforced): %s", f)
+    else:
+        errors.extend(found)
+
+
+def _naming_request_view(payload: RequestIn) -> dict:
+    """Minimal request dict for naming.build_context (no project_id yet at intake)."""
+    return {
+        "business_domain": payload.business_domain,
+        "medallion_layer": payload.medallion_layer,
+        "environment": payload.environment.value,
+        "region": payload.region,
+        "business_function": payload.business_function,
+        "business_sub_function": payload.business_sub_function,
+    }
+
+
+def _resource_name_errors(payload: RequestIn) -> list[str]:
+    """Validate any user-supplied per-resource name override against its convention."""
+    errs: list[str] = []
+    req = _naming_request_view(payload)
+    for r in payload.resources:
+        rt = r.type.value
+        cfg = r.config or {}
+        override = cfg.get("name") or cfg.get("deployment_name")
+        if not override:
+            continue
+        name_errs = naming.validate_name(rt, str(override))
+        if name_errs:
+            suggestion = naming.suggest_name(rt, naming.build_context(req, cfg))
+            errs.extend(f"{e} — suggested: '{suggestion}'" for e in name_errs)
+    return errs
 
 
 def _validate_resource_options(resources) -> list[str]:
@@ -235,4 +339,7 @@ def _validate_resource_options(resources) -> list[str]:
             _in(cfg.get("index_type"), VS_INDEX_TYPES, "index_type")
             _in(cfg.get("embedding_source"), VS_EMBEDDING_SOURCES, "embedding_source")
             _in(cfg.get("pipeline_type"), VS_PIPELINE_TYPES, "pipeline_type")
+        elif rt == "sql_warehouse":
+            _in(cfg.get("cluster_size"), WAREHOUSE_SIZES, "warehouse size")
+            _in(cfg.get("warehouse_type"), WAREHOUSE_TYPES, "warehouse type")
     return errs

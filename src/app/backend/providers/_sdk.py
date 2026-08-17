@@ -7,6 +7,7 @@ Centralizes the researched mechanisms so providers stay small:
 All calls are synchronous; the service layer runs them via asyncio.to_thread.
 """
 import logging
+import re
 from typing import Optional
 
 logger = logging.getLogger("pave.sdk")
@@ -14,6 +15,40 @@ logger = logging.getLogger("pave.sdk")
 # Cache of WorkspaceClients keyed by target host. The default (app's own workspace)
 # is stored under the empty-string key. See client() for the multi-workspace story.
 _clients: dict[str, object] = {}
+
+
+def list_groups(target_workspace: Optional[str] = None) -> list[str]:
+    """Display names of Databricks groups visible in the (target) workspace.
+
+    The owner-group picker binds to a REAL Databricks group (the principal PAVE grants
+    to), not a free-typed AD string. Best-effort: returns [] on any auth/network error so
+    the UI degrades to a free-text field + naming-convention validation.
+    """
+    try:
+        w = client(target_workspace or None)
+        return sorted({g.display_name for g in w.groups.list() if g.display_name})
+    except Exception as e:  # noqa: BLE001
+        logger.info("list_groups unavailable (%s)", e)
+        return []
+
+
+def group_exists(name: str, target_workspace: Optional[str] = None) -> bool:
+    """True if `name` resolves to a real Databricks group in the (target) workspace.
+
+    Used at submit to decide whether the owning group is an EXISTING group (accepted
+    as-is) or a NEW one (must satisfy the naming convention). Best-effort; any error
+    returns False so the caller falls back to enforcing the new-group convention.
+    """
+    n = (name or "").strip()
+    if not n:
+        return False
+    try:
+        w = client(target_workspace or None)
+        return any((g.display_name or "").strip() == n
+                   for g in w.groups.list(filter=f'displayName eq "{n}"'))
+    except Exception as e:  # noqa: BLE001
+        logger.info("group_exists check unavailable for %r (%s)", n, e)
+        return False
 
 
 def client(target_workspace: Optional[str] = None):
@@ -36,10 +71,19 @@ def client(target_workspace: Optional[str] = None):
     run never breaks. That is why this is safe to ship untested against real targets.
     """
     from databricks.sdk import WorkspaceClient
+    from .. import config
 
     host = (target_workspace or "").strip()
     if host in _clients:
         return _clients[host]
+
+    # Defence in depth: intake validates target_workspace too, but this is the boundary
+    # where ambient service-principal credentials would actually be presented to a host,
+    # so an unapproved host must never get this far.
+    if host and host not in config.target_workspaces():
+        raise ValueError(
+            f"target workspace '{host}' is not in the approved list "
+            f"(PAVE_TARGET_WORKSPACES); refusing to authenticate against it")
 
     if not host:
         # Default: the app's own workspace (no host arg -> ambient auth).
@@ -71,6 +115,49 @@ def client(target_workspace: Optional[str] = None):
     return _clients[host]
 
 
+def push_live_tags(asset: dict, tags: dict, target_workspace: Optional[str] = None) -> dict:
+    """Best-effort push of a refreshed tag set onto the LIVE resource for a REAL asset —
+    used by amendment re-tag and ownership reassignment so an edit follows onto the actual
+    securable, not just PAVE's registry.
+
+    UC securables (schema/catalog) go through the tag-assignment API (with SQL fallback).
+    Compute/endpoint types keep the custom_tags applied at create time and are NOT
+    live-retagged here (an in-place edit would restart/mutate them) -> reported registry-only.
+    Simulated assets are always registry-only. Never raises; returns a status dict for audit.
+    """
+    if asset.get("mode") != "real":
+        return {"via": "registry-only", "reason": "simulated asset"}
+    ent = {"schema": "schemas", "catalog": "catalogs"}.get(asset.get("type"))
+    if not ent:
+        return {"via": "registry-only", "reason": f"{asset.get('type')} not live-retaggable in place"}
+    try:
+        return apply_uc_tags(ent, asset.get("external_id"), tags, target_workspace)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("live re-tag failed for %s: %s", asset.get("external_id"), e)
+        return {"via": "error", "error": str(e)[:200]}
+
+
+def _sql_literal(value) -> str:
+    """Quote a value as a SQL string literal. Tag values carry request-derived text, so
+    they cannot be interpolated raw — the statement-execution API takes no bind
+    parameters for DDL, which makes correct quoting the only defence."""
+    return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+_IDENT_PART = re.compile(r"^[A-Za-z_][A-Za-z0-9_\-]*$")
+
+
+def _sql_identifier(name: str) -> str:
+    """Backtick-quote a (possibly dotted) UC identifier, rejecting anything that is not a
+    plain name. Names come from the naming service, so a value failing this is a bug or
+    an attack, and either way must not reach the statement."""
+    parts = str(name).split(".")
+    for p in parts:
+        if not _IDENT_PART.match(p):
+            raise ValueError(f"unsafe SQL identifier: {name!r}")
+    return ".".join(f"`{p}`" for p in parts)
+
+
 def apply_uc_tags(entity_type: str, entity_name: str, tags: dict[str, str],
                   target_workspace: Optional[str] = None) -> dict:
     """Assign UC tags to a securable.
@@ -86,15 +173,15 @@ def apply_uc_tags(entity_type: str, entity_name: str, tags: dict[str, str],
     w = client(target_workspace)
     applied, errors = [], []
 
-    # 1) entity_tag_assignments API
+    # 1) entity_tag_assignments API (object-based create in current SDK 0.1xx)
     try:
         svc = getattr(w, "entity_tag_assignments", None)
-        if svc is not None:
+        if svc is not None and getattr(svc, "create", None) is not None:
+            from databricks.sdk.service.catalog import EntityTagAssignment
             for k, v in tags.items():
-                svc.create(
+                svc.create(tag_assignment=EntityTagAssignment(
                     entity_type=entity_type, entity_name=entity_name,
-                    tag_key=k, tag_value=str(v),
-                )
+                    tag_key=k, tag_value=str(v)))
                 applied.append(k)
             return {"applied": applied, "via": "api", "errors": errors}
     except Exception as e:  # noqa: BLE001
@@ -105,8 +192,8 @@ def apply_uc_tags(entity_type: str, entity_name: str, tags: dict[str, str],
     try:
         sql_type = {"schemas": "SCHEMA", "catalogs": "CATALOG", "tables": "TABLE"}.get(
             entity_type, "SCHEMA")
-        pairs = ", ".join(f"'{k}' = '{str(v)}'" for k, v in tags.items())
-        run_sql(f"ALTER {sql_type} {entity_name} SET TAGS ({pairs})",
+        pairs = ", ".join(f"{_sql_literal(k)} = {_sql_literal(v)}" for k, v in tags.items())
+        run_sql(f"ALTER {sql_type} {_sql_identifier(entity_name)} SET TAGS ({pairs})",
                 target_workspace=target_workspace)
         return {"applied": list(tags), "via": "sql", "errors": errors}
     except Exception as e:  # noqa: BLE001

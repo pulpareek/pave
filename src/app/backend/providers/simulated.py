@@ -8,6 +8,7 @@ import uuid
 from typing import Any
 
 from .base import Provider, ProvisionResult, new_asset_id
+from .. import naming
 
 
 class SimulatedProvider(Provider):
@@ -18,7 +19,7 @@ class SimulatedProvider(Provider):
                   tag_set: dict[str, str], context: dict[str, Any]) -> ProvisionResult:
         cfg = resource.get("config", {})
         project_id = request.get("project_id", "proj")
-        name = cfg.get("name") or f"{self.resource_type}-{project_id}"
+        name = naming.resolve_name(self.resource_type, request, cfg)
         synthetic_id = f"sim-{self.resource_type}-{uuid.uuid4().hex[:12]}"
 
         # Model the chosen governed options so the (simulated) result tells the real story.
@@ -26,12 +27,16 @@ class SimulatedProvider(Provider):
         names = {"name": name, **{k: str(v) for k, v in modeled.items()
                                   if isinstance(v, (str, int, float, bool)) and v not in (None, "")}}
         return ProvisionResult(
-            asset_id=new_asset_id(self.resource_type, project_id),
+            asset_id=new_asset_id(self.resource_type, project_id, context),
             type=self.resource_type,
             names=names,
             external_id=synthetic_id,
             applied_tags=tag_set,
             mode="simulated",
+            # The registry overwrites this when it fell back from a real provider, so the
+            # asset carries the specific reason rather than the generic one.
+            mode_reason="configured_simulated",
+            degraded=False,
             status="ACTIVE",
             provenance={"modeled_config": modeled},
         )

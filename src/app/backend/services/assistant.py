@@ -15,7 +15,7 @@ from ..models import BUSINESS_DOMAINS, BUSINESS_TAXONOMY
 
 logger = logging.getLogger("pave.assistant")
 
-LLM_ENDPOINT = os.getenv("LLM_ENDPOINT", "databricks-claude-sonnet-4")
+LLM_ENDPOINT = os.getenv("LLM_ENDPOINT", "databricks-claude-opus-4-8")
 
 _RESOURCE_HINTS = {
     "schema": ["schema", "table", "data", "catalog data", "dataset", "delta"],
@@ -133,7 +133,9 @@ def _foundation_model(text: str) -> dict | None:
                             content=_SYS.format(domains=", ".join(BUSINESS_DOMAINS))),
                 ChatMessage(role=ChatMessageRole.USER, content=text),
             ],
-            temperature=0.0, max_tokens=600,
+            # NOTE: do NOT send `temperature` — current Databricks FM endpoints (Claude Opus 4.x/5,
+            # GPT-5.x) reject it with BAD_REQUEST. max_tokens is enough to bound the JSON reply.
+            max_tokens=600,
         )
         content = resp.choices[0].message.content
         m = re.search(r"\{.*\}", content, re.DOTALL)

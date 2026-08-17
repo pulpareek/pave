@@ -13,7 +13,8 @@ import os
 from typing import Any
 
 from . import _sdk
-from .base import Provider, ProvisionResult, new_asset_id
+from .base import Provider, ProvisionResult, classify_error, new_asset_id
+from .. import naming
 from ..models import ALLOWED_AI_MODELS
 
 logger = logging.getLogger("pave.provider.ai_gateway")
@@ -48,18 +49,19 @@ class AIGatewayEndpointProvider(Provider):
                   tag_set: dict[str, str], context: dict[str, Any]) -> ProvisionResult:
         cfg = resource.get("config", {})
         project_id = request.get("project_id", "proj")
-        team = (tag_set.get("owner_group") or request.get("business_domain") or "team")
-        name = (cfg.get("name") or f"llm-{team}-{project_id.split('-')[-1]}").lower().replace("_", "-")[:60]
+        name = naming.resolve_name("llm_gateway_endpoint", request, cfg)
         gov = _governance(cfg, tag_set)
         gov_tags = {**tag_set, "ai_model": gov["model"]["name"] or "", "ai_endpoint": name}
 
         mode, external_id, provenance = "simulated", f"sim-llm-{name}", {"engine": "modeled"}
-        created = self._try_create_real(name, cfg, gov, request.get("target_workspace"))
+        created, reason = self._try_create_real(request, name, cfg, gov)
         if created:
             mode, external_id, provenance = "real", created["name"], created
 
         return ProvisionResult(
-            asset_id=new_asset_id("llm_gateway_endpoint", project_id),
+            asset_id=new_asset_id("llm_gateway_endpoint", project_id, context),
+            mode_reason=reason,
+            degraded=mode != "real" and reason != "configured_simulated",
             type="llm_gateway_endpoint",
             names={"name": name, **{f"gateway_{k}": str(v) for k, v in {
                 "model": gov["model"]["name"], "qpm": gov["rate_limits"]["qpm"],
@@ -73,62 +75,143 @@ class AIGatewayEndpointProvider(Provider):
             provenance={"ai_governance": gov, **provenance},
         )
 
-    def _try_create_real(self, name, cfg, gov, target_workspace=None) -> dict | None:
-        """Attempt a real serving endpoint with the ai_gateway block; None on any gap."""
+    def _try_create_real(self, request, name, cfg, gov) -> tuple[dict | None, str]:
+        """Create the real governed gateway. Databricks-hosted FMs go through the Unity
+        Catalog AI Gateway (a `model service`: governed UC securable + rate limits +
+        inference-table logging + routing to a pay-per-token FM). External models
+        (OpenAI/Anthropic) go through a serving endpoint + AI Gateway block (needs a provider
+        API-key secret). Returns (created, reason); a None create always carries the reason."""
         from .. import config
         if not config.ALLOW_REAL:
-            return None
+            return None, "kill_switch_off"
+        provider = cfg.get("provider", "databricks")
+        if provider in ("openai", "anthropic"):
+            return self._create_external_serving(request, name, cfg, gov)
+        return self._create_uc_model_service(request, name, cfg, gov)
+
+    def _resolve_fm_model(self, w, requested: str) -> tuple[str, str]:
+        """Map the requested model to a `models/system.ai.<name>` reference for a REGISTERED
+        Databricks FM — preferring the request's choice, falling back to a known chat model
+        when it isn't registered (older allow-list entries can be retired)."""
+        want = (requested or "").replace("system.ai.", "").strip()
+        names = set()
+        try:
+            names = {m.name for m in w.registered_models.list(catalog_name="system", schema_name="ai")}
+        except Exception:  # noqa: BLE001
+            pass
+        if want and (want in names or not names):
+            return f"models/system.ai.{want}", want
+        for d in ("databricks-claude-opus-4-8", "databricks-claude-sonnet-4", "databricks-claude-opus-5"):
+            if not names or d in names:
+                return f"models/system.ai.{d}", d
+        d = want or "databricks-claude-opus-4-8"
+        return f"models/system.ai.{d}", d
+
+    def _create_uc_model_service(self, request, name, cfg, gov) -> tuple[dict | None, str]:
+        """POST /api/2.1/unity-catalog/model-services — the Unity Catalog AI Gateway. The
+        governed gateway lives in the project's UC schema and routes to a pay-per-token FM.
+        NOTE: PII/safety guardrails are recorded as governance intent but are NOT part of the
+        model-service config in this API version — rate limits, inference-table logging,
+        governed UC access, and routing ARE enforced."""
+        from .. import config, naming
+        catalog = (request.get("parent_catalog") or config.PARENT_CATALOG or "").strip()
+        if not catalog:
+            return None, "missing_prerequisite"           # no catalog to place the gateway in
+        schema = naming.resolve_name("schema", request, {})
+        parent = f"schemas/{catalog}.{schema}"
+        w = _sdk.client(request.get("target_workspace"))
+        model_ref, resolved = self._resolve_fm_model(w, cfg.get("model"))
+        qpm = int(gov["rate_limits"]["qpm"] or 100)
+        body = {
+            "config": {
+                "rate_limits": [{"key": "RATE_LIMIT_KEY_SERVICE",
+                                 "renewal_period": "RATE_LIMIT_RENEWAL_PERIOD_MINUTE",
+                                 "requests": str(qpm)}],
+                "routing": {"destinations": [{
+                    "name": "primary",
+                    "destination_type": "DESTINATION_TYPE_PAY_PER_TOKEN_FOUNDATION_MODEL",
+                    "pay_per_token_config": {"model": model_ref},
+                    "traffic_percentage": 100}]},
+            },
+            "comment": f"PAVE governed AI gateway for {request.get('project_id')} -> {resolved}",
+        }
+        if gov["inference_logging"]:
+            # The inference (payload-logging) table lives in a UC schema too — `parent` is
+            # required and must be `schemas/{catalog}.{schema}` (same schema as the service).
+            body["config"]["inference_table"] = {
+                "parent": parent, "table_name_prefix": name[:40], "disabled": False}
+        try:
+            r = w.api_client.do("POST", "/api/2.1/unity-catalog/model-services",
+                                query={"parent": parent, "model_service_id": name}, body=body)
+            full = (r.get("name") or "").replace("model-services/", "") or f"{catalog}.{schema}.{name}"
+            return {"name": full, "id": r.get("id"), "model": resolved,
+                    "engine": "uc_ai_gateway.model_service",
+                    "api_types": r.get("supported_api_types"),
+                    "guardrails_note": "recorded intent (not enforced by model-service config)"}, "real"
+        except Exception as e:  # noqa: BLE001
+            reason = classify_error(e)
+            logger.warning("UC AI gateway model-service create failed (%s: %s); modelling instead",
+                           reason, e)
+            return None, reason
+
+    def _create_external_serving(self, request, name, cfg, gov) -> tuple[dict | None, str]:
+        """External model (OpenAI/Anthropic) via a serving endpoint + AI Gateway block — needs
+        a provider API-key secret (AI_GATEWAY_SECRET_SCOPE/KEY)."""
+        scope, key = os.getenv("AI_GATEWAY_SECRET_SCOPE"), os.getenv("AI_GATEWAY_SECRET_KEY")
+        if not (scope and key):
+            return None, "missing_prerequisite"
+        provider = cfg.get("provider")
         try:
             from databricks.sdk.service.serving import (
                 EndpointCoreConfigInput, ServedEntityInput, ExternalModel,
                 AiGatewayConfig, AiGatewayRateLimit, AiGatewayGuardrails,
                 AiGatewayGuardrailParameters, AiGatewayInferenceTableConfig,
-                AiGatewayUsageTrackingConfig,
+                AiGatewayUsageTrackingConfig, AiGatewayGuardrailPiiBehavior,
+                AiGatewayGuardrailPiiBehaviorBehavior, AiGatewayRateLimitKey,
+                AiGatewayRateLimitRenewalPeriod,
             )
-        except Exception as e:  # noqa: BLE001
-            logger.info("AI Gateway SDK types unavailable (%s); modeling instead", e)
-            return None
-
-        provider = cfg.get("provider", "databricks")
-        scope, key = os.getenv("AI_GATEWAY_SECRET_SCOPE"), os.getenv("AI_GATEWAY_SECRET_KEY")
-        if provider in ("openai", "anthropic") and not (scope and key):
-            logger.info("external provider %s needs AI_GATEWAY_SECRET_*; modeling instead", provider)
-            return None
-
-        w = _sdk.client(target_workspace)
+        except Exception:  # noqa: BLE001
+            return None, "sdk_unavailable"
+        w = _sdk.client(request.get("target_workspace"))
         try:
             served = ServedEntityInput(
                 name=f"{name}-entity",
                 external_model=ExternalModel(
                     name=cfg.get("model"), provider=provider, task=cfg.get("task", "llm/v1/chat"),
-                    **({f"{provider}_config": {f"{provider}_api_key": f"{{{{secrets/{scope}/{key}}}}}"}}
-                       if provider in ("openai", "anthropic") else {})),
-            )
-            guard_params = AiGatewayGuardrailParameters(
-                pii=({"behavior": "BLOCK"} if "pii_block" in gov["guardrails"]
-                     else {"behavior": "MASK"} if "pii_redact" in gov["guardrails"] else None),
-                safety=("safety" in gov["guardrails"]) or None,
-            )
+                    **{f"{provider}_config": {f"{provider}_api_key": f"{{{{secrets/{scope}/{key}}}}}"}}))
+            _pii = (AiGatewayGuardrailPiiBehavior(behavior=AiGatewayGuardrailPiiBehaviorBehavior.BLOCK)
+                    if "pii_block" in gov["guardrails"]
+                    else AiGatewayGuardrailPiiBehavior(behavior=AiGatewayGuardrailPiiBehaviorBehavior.MASK)
+                    if "pii_redact" in gov["guardrails"] else None)
             ai_gw = AiGatewayConfig(
                 rate_limits=[AiGatewayRateLimit(calls=gov["rate_limits"]["qpm"],
-                                                key="user", renewal_period="minute")],
-                guardrails=AiGatewayGuardrails(input=guard_params, output=guard_params),
+                                                key=AiGatewayRateLimitKey.USER,
+                                                renewal_period=AiGatewayRateLimitRenewalPeriod.MINUTE)],
+                guardrails=AiGatewayGuardrails(input=AiGatewayGuardrailParameters(
+                    pii=_pii, safety=("safety" in gov["guardrails"]) or None)),
                 usage_tracking_config=AiGatewayUsageTrackingConfig(enabled=True),
                 inference_table_config=(AiGatewayInferenceTableConfig(
                     enabled=True, catalog_name=os.getenv("AUDIT_CATALOG", ""),
-                    schema_name=os.getenv("AUDIT_SCHEMA", "pave")) if gov["inference_logging"] else None),
-            )
+                    schema_name=os.getenv("AUDIT_SCHEMA", "pave")) if gov["inference_logging"] else None))
             ep = w.serving_endpoints.create(
-                name=name, config=EndpointCoreConfigInput(served_entities=[served]), ai_gateway=ai_gw)
-            ep_name = getattr(ep, "name", None) or name
-            return {"name": ep_name, "engine": "serving_endpoints.create+ai_gateway"}
+                name=name, config=EndpointCoreConfigInput(name=name, served_entities=[served]),
+                ai_gateway=ai_gw)
+            return {"name": getattr(ep, "name", None) or name,
+                    "engine": "serving_endpoints.create+ai_gateway"}, "real"
         except Exception as e:  # noqa: BLE001
-            logger.warning("real AI gateway endpoint create failed (%s); modeling instead", e)
-            return None
+            reason = classify_error(e)
+            logger.warning("external AI gateway endpoint create failed (%s: %s); modelling", reason, e)
+            return None, reason
 
     def decommission(self, *, asset: dict[str, Any], context: dict[str, Any]) -> None:
-        if asset.get("mode") == "real" and asset.get("external_id"):
-            try:
-                _sdk.client(context.get("target_workspace")).serving_endpoints.delete(name=asset["external_id"])
-            except Exception as e:  # noqa: BLE001
-                logger.warning("serving endpoint delete failed: %s", e)
+        if asset.get("mode") != "real" or not asset.get("external_id"):
+            return
+        ext = asset["external_id"]
+        w = _sdk.client(context.get("target_workspace"))
+        try:
+            if str(ext).count(".") >= 2:      # catalog.schema.leaf -> UC AI Gateway model service
+                w.api_client.do("DELETE", f"/api/2.1/unity-catalog/model-services/{ext}")
+            else:                             # serving endpoint (external-model path)
+                w.serving_endpoints.delete(name=ext)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("AI gateway delete failed: %s", e)
