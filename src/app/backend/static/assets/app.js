@@ -53,9 +53,44 @@ function toDate(v) {
 function toast(msg, ok = true) {
   const t = document.getElementById("toast");
   t.textContent = msg;
-  t.style.borderColor = ok ? "var(--accent-2)" : "var(--red)";
-  t.classList.remove("hidden");
+  t.classList.remove("ok", "err", "warn", "hidden");
+  t.classList.add(ok === "warn" ? "warn" : ok === false ? "err" : "ok");
   setTimeout(() => t.classList.add("hidden"), 3800);
+}
+
+// ---- UI polish helpers ------------------------------------------------------
+// Reusable empty-state block (icon + title + one line + optional action HTML).
+function emptyState(title, desc, actionHtml = "") {
+  return `<div class="empty-state">
+    <svg class="es-ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16M4 12h16M4 19h9"/></svg>
+    <h3>${esc(title)}</h3><p>${esc(desc)}</p>${actionHtml}</div>`;
+}
+// Shimmer placeholder rows while a list loads.
+function skeletonRows(n = 6) {
+  return Array.from({ length: n }).map(() => `<div class="skeleton skel-row"></div>`).join("");
+}
+// Count a numeric element up to its value, preserving any prefix ($) / suffix (× %).
+function animateCount(elm) {
+  const raw = (elm.textContent || "").trim();
+  const m = raw.match(/^(\D*?)(-?[\d,]*\.?\d+)(\D*)$/);
+  if (!m) return;
+  const prefix = m[1], suffix = m[3], numStr = m[2].replace(/,/g, "");
+  const target = parseFloat(numStr);
+  if (!isFinite(target) || target === 0) return;
+  const decimals = numStr.includes(".") ? numStr.split(".")[1].length : 0;
+  const fmt = (n) => (decimals ? n.toFixed(decimals) : String(Math.round(n)))
+    .replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  const steps = 32; let i = 0;
+  elm.textContent = prefix + fmt(0) + suffix;
+  const timer = setInterval(() => {
+    i++;
+    elm.textContent = prefix + fmt(target * i / steps) + suffix;
+    if (i >= steps) { clearInterval(timer); elm.textContent = raw; }
+  }, 26);
+}
+function animateKpis(root) {
+  if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  (root || document).querySelectorAll(".kpi").forEach(animateCount);
 }
 const el = (tag, attrs = {}, html = "") => {
   const e = document.createElement(tag);
@@ -1555,9 +1590,14 @@ function prefillIntake(rq) {
 // Request-centric lifecycle view: the home a request has AFTER submit. Serves the
 // requester (track my submissions + amend), the approver (full ledger of decisions), and
 // compliance/audit (signatures + audit trail on every request).
-const STATUS_PILL = { ACTIVE: "real", APPROVED: "real", PROVISIONING: "", PARTIAL: "degraded",
-                      FAILED: "tier2", REJECTED: "tier2", DECOMMISSIONED: "" };
-const statusPillClass = (s) => STATUS_PILL[s] || "";
+const STATUS_PILL = {
+  ACTIVE: "st-ok", APPROVED: "st-ok",
+  PENDING_APPROVAL: "st-warn", PARTIAL: "st-warn",
+  PROVISIONING: "st-run", IN_PROGRESS: "st-run",
+  FAILED: "st-err", REJECTED: "st-err",
+  DECOMMISSIONED: "st-neutral",
+};
+const statusPillClass = (s) => STATUS_PILL[s] || "st-neutral";
 
 async function renderRequests() {
   const v = document.getElementById("view-requests");
@@ -1602,7 +1642,7 @@ async function renderRequests() {
                    ...(r.resources || []).map(x => x.type)].filter(Boolean).join(" ").toLowerCase();
       return hay.includes(q);
     });
-    if (!rows.length) { tableCard.innerHTML = `<p class="muted">No requests match these filters.</p>`; return; }
+    if (!rows.length) { tableCard.innerHTML = emptyState("No requests match", "Try clearing the search or filters above."); return; }
     rows.sort((a, b) => ((toDate(b.created_at) || 0) - (toDate(a.created_at) || 0)));
     const t = el("table");
     t.innerHTML = `<thead><tr><th>Use case / project</th><th>Tier</th><th>Status</th><th>Approvals</th><th>Resources</th><th>Requester</th><th>Created</th></tr></thead>`;
@@ -1639,6 +1679,7 @@ async function renderRequests() {
     tableCard.innerHTML = ""; tableCard.appendChild(t);
   };
   const load = async () => {
+    tableCard.innerHTML = skeletonRows(6);
     const qs = new URLSearchParams();
     if (document.getElementById("rq-mine").checked) qs.set("mine", "true");
     const status = document.getElementById("rq-status").value;
@@ -1666,7 +1707,7 @@ async function renderApprovals() {
     v.appendChild(el("div", { class: "errors" }, `Switch persona to <b>Platform approver</b> or <b>Security &amp; compliance</b> to review (status ${e.status}).`));
     return;
   }
-  if (!queue.length) { v.appendChild(el("p", { class: "muted" }, "Queue is empty.")); return; }
+  if (!queue.length) { v.appendChild(el("div", {}, emptyState("No approvals pending", "You're all caught up — nothing is waiting on a decision right now."))); return; }
   let highlightCard = null;
   queue.forEach((r) => {
     const c = el("div", { class: "card" });
@@ -1874,7 +1915,7 @@ async function renderRegistry() {
 
     tb.innerHTML = "";
     if (!filtered.length) {
-      tb.innerHTML = `<tr><td colspan="8" class="muted">No assets match filters.</td></tr>`;
+      tb.innerHTML = `<tr><td colspan="8">${emptyState("No assets match", "Adjust the filters, or provision a request to populate the registry.")}</td></tr>`;
       return;
     }
     filtered.forEach(a => {
@@ -2087,6 +2128,7 @@ async function renderGovernance() {
     <div class="card"><div class="muted">Tag drift</div><div class="kpi ${sw.tag_drift.length ? 'warn' : 'good'}">${sw.tag_drift.length}</div></div>
     <div class="card"><div class="muted">Recert due</div><div class="kpi ${rc.due_count ? 'warn' : 'good'}">${rc.due_count}</div></div>`;
   v.appendChild(kpis);
+  animateKpis(kpis);
 
   // Past sunset -> reclaim
   v.appendChild(el("div", { class: "section-title" }, "<h2>Sunset autopilot</h2>"));
@@ -2265,6 +2307,7 @@ async function renderFinops() {
     `${esc(imp.manual_baseline_days)}-day manual baseline, $${esc((imp.assumptions || {}).engineer_day_cost_usd)}/engineer-day. ` +
     `Replace with the customer's own cycle time before quoting.`));
   v.appendChild(roi);
+  animateKpis(roi);
 
   const kpis = el("div", { class: "grid cols-4" });
   const covClass = s.tag_coverage_pct >= 95 ? "good" : "warn";
@@ -2277,6 +2320,7 @@ async function renderFinops() {
       <div class="muted" style="font-size:11px">~100% by construction — see attribution below</div></div>
     <div class="card"><div class="muted">Untagged cost</div><div class="kpi ${s.untagged_cost ? 'warn' : 'good'}">$${esc(s.untagged_cost)}</div></div>`;
   v.appendChild(kpis);
+  animateKpis(kpis);
 
   await renderAttribution(v);
 
