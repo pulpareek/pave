@@ -59,6 +59,26 @@ rarely-changing platform substrate (metastore/account) and **DABs** to deploy PA
 an opt-in schema showcase). See [`docs/architecture/`](docs/architecture/README.md)
 (09-hybrid-provisioning, 10-reconcile-drift, 18-record-as-code) for the full rationale.
 
+## Built to extend
+
+Two extension directions are worth flagging explicitly — they show PAVE is a governed
+*pipeline*, not a Databricks-only script:
+
+- **Provisioning engine — SDK today, IaC-renderable.** PAVE provisions through the Databricks
+  SDK/REST APIs, and every approved request also emits a declarative, tagged desired-state
+  manifest (`GET /api/requests/{id}/spec`). Because the request is already captured as desired
+  state, the *same* request can be rendered as a **templated Terraform script** for teams that
+  standardize on IaC — without changing the intake, approval, or governance flow.
+- **Beyond Databricks — a pluggable provider model.** Provisioning sits behind a provider
+  abstraction (`backend/providers/`), so the same **intake → approval → governance → attribution**
+  pipeline can be pointed at new asset types. The same golden path could vend not just Databricks
+  assets but **cloud resources — e.g. AWS S3 buckets or IAM roles** — each born tagged, owned,
+  attributed, and audited under one governed workflow.
+
+Both are **extension points, not shipped integrations today** — but the architecture
+(record-as-code + the provider interface) is deliberately shaped so adding them doesn't require
+reworking the core.
+
 ## Where PAVE fits as Databricks goes serverless
 
 A reasonable challenge: *if serverless makes spinning up compute trivial, does a provisioning
